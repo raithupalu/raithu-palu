@@ -32,7 +32,7 @@ const CustomerNoteSchema = new Schema<ICustomerNoteDocument>(
   { timestamps: true, collection: 'customerNotes' }
 );
 
-CustomerNoteSchema.index({ customerId: 1, createdAt: -1 }, { name: 'customer_note_timeline' });
+CustomerNoteSchema.index({ customerId: 1, createdAt: -1, _id: -1 }, { name: 'customer_note_timeline' });
 
 export const CustomerNoteModel: Model<ICustomerNoteDocument> =
   mongoose.models.CustomerNote || mongoose.model<ICustomerNoteDocument>('CustomerNote', CustomerNoteSchema);

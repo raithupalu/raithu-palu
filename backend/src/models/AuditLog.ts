@@ -117,8 +117,8 @@ const AuditLogSchema = new Schema<IAuditLogDocument>(
   }
 );
 
-AuditLogSchema.index({ createdAt: -1 }, { name: 'audit_created_desc' });
-AuditLogSchema.index({ targetUserId: 1, createdAt: -1 }, { name: 'audit_target_user' });
+AuditLogSchema.index({ createdAt: -1, _id: -1 }, { name: 'audit_created_desc' });
+AuditLogSchema.index({ targetUserId: 1, createdAt: -1, _id: -1 }, { name: 'audit_target_user' });
 
 export const AuditLogModel: Model<IAuditLogDocument> =
   mongoose.models.AuditLog ||

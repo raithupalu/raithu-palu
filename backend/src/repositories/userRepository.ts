@@ -1045,6 +1045,36 @@ class InMemoryUserStore {
     this.roleSequenceFloor.clear();
     this.saveToDisk();
   }
+
+  // Snapshot helpers for in-memory transaction rollback
+  public snapshot(): { byId: Map<string, UserEntity>; byMobile: Map<string,string>; byUserCode: Map<string,string>; roleSequenceFloor: Map<UserRole, number> } {
+    this.loadFromDisk();
+    const byIdCopy = new Map<string, UserEntity>();
+    for (const [k,v] of this.byId.entries()) byIdCopy.set(k, cloneEntity(v));
+    return {
+      byId: byIdCopy,
+      byMobile: new Map(this.byMobile),
+      byUserCode: new Map(this.byUserCode),
+      roleSequenceFloor: new Map(this.roleSequenceFloor),
+    };
+  }
+  public restore(snapshot: { byId: Map<string, UserEntity>; byMobile: Map<string,string>; byUserCode: Map<string,string>; roleSequenceFloor: Map<UserRole, number> }): void {
+    this.byId = new Map(snapshot.byId);
+    this.byMobile = new Map(snapshot.byMobile);
+    this.byUserCode = new Map(snapshot.byUserCode);
+    this.roleSequenceFloor = new Map(snapshot.roleSequenceFloor);
+    this.saveToDisk();
+  }
+  // Direct delete helper for rollback of newly created entities
+  public deleteById(id: string): void {
+    this.loadFromDisk();
+    const entity = this.byId.get(id);
+    if (!entity) return;
+    this.byId.delete(id);
+    if (entity.mobileNumber) this.byMobile.delete(entity.mobileNumber);
+    if (entity.userCode) this.byUserCode.delete(entity.userCode.toUpperCase());
+    this.saveToDisk();
+  }
 }
 
 export const inMemoryUserStore = new InMemoryUserStore();
@@ -1148,7 +1178,7 @@ export const userRepository = {
     return doc ? mapDocToEntity(doc) : null;
   },
 
-  async createCustomer(input: CreateCustomerInput): Promise<UserEntity> {
+  async createCustomer(input: CreateCustomerInput, session?: mongoose.ClientSession): Promise<UserEntity> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
       return inMemoryUserStore.createCustomer(input);
@@ -1178,8 +1208,8 @@ export const userRepository = {
           lastLoginAt: now,
         };
         // If deliveryAddresses empty but address present, keep legacy address
-        const created = await UserModel.create(docToCreate);
-        return mapDocToEntity(created);
+        const created = session ? await UserModel.create([docToCreate], { session }).then(docs=> docs[0]) : await UserModel.create(docToCreate);
+        return mapDocToEntity(created as unknown as import('../models/User').IUserDocument);
       } catch (err: unknown) {
         if (isUserCodeDuplicateError(err) && attempt < MAX_USER_CODE_RETRIES) {
           continue;
@@ -1202,8 +1232,8 @@ export const userRepository = {
     );
   },
 
-  async createCustomerAdmin(input: CreateCustomerAdminInput): Promise<UserEntity> {
-    return this.createCustomer(input);
+  async createCustomerAdmin(input: CreateCustomerAdminInput, session?: mongoose.ClientSession): Promise<UserEntity> {
+    return this.createCustomer(input, session);
   },
 
   async provisionAdmin(
@@ -1392,43 +1422,65 @@ export const userRepository = {
     }
     const query: Record<string, unknown> = andClauses.length === 1 ? andClauses[0] as Record<string, unknown> : { $and: andClauses };
 
-    const total = await UserModel.countDocuments(query).exec();
     const page = filter.page ?? 1;
     const limit = filter.limit ?? 20;
     const sortField: Record<string, 1|-1> = filter.sort === 'fullName' ? { fullName: 1 } as unknown as Record<string, 1|-1> : { createdAt: -1 };
+
+    // For pincode filter, use aggregation to filter archived addresses BEFORE pagination (correct DB-level filtering)
+    if (filter.pincode?.trim()) {
+      const p = filter.pincode.trim();
+      const pipeline: unknown[] = [
+        { $match: query },
+        {
+          $addFields: {
+            hasMatchingAddress: {
+              $or: [
+                {
+                  $gt: [
+                    {
+                      $size: {
+                        $filter: {
+                          input: { $ifNull: ['$deliveryAddresses', []] },
+                          as: 'addr',
+                          cond: { $and: [{ $eq: ['$$addr.pincode', p] }, { $eq: ['$$addr.isArchived', false] }] }
+                        }
+                      }
+                    },
+                    0
+                  ]
+                },
+                {
+                  $and: [
+                    { $eq: [{ $size: { $ifNull: ['$deliveryAddresses', []] } }, 0] },
+                    { $eq: ['$address.pincode', p] }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        { $match: { hasMatchingAddress: true } },
+        {
+          $facet: {
+            metadata: [{ $count: 'total' }],
+            data: [{ $sort: sortField }, { $skip: (page - 1) * limit }, { $limit: limit }]
+          }
+        }
+      ];
+      const result = await UserModel.aggregate(pipeline as never[]).exec() as unknown as Array<{ metadata: Array<{ total: number }>; data: unknown[] }>;
+      const total = result[0]?.metadata[0]?.total ?? 0;
+      const docs = result[0]?.data ?? [];
+      const customers = (docs as unknown as Parameters<typeof mapDocToEntity>[0][]).map(mapDocToEntity);
+      return { customers, total };
+    }
+
+    const total = await UserModel.countDocuments(query).exec();
     const docs = await UserModel.find(query)
       .sort(sortField)
       .skip((page-1)*limit)
       .limit(limit)
       .exec();
-    // Post-filter archived pincode edge: ensure JS-level filter matches in-memory behavior (exclude archived if pincode matches only archived)
-    let customers = docs.map(mapDocToEntity);
-    if (filter.pincode?.trim()) {
-      const p = filter.pincode.trim();
-      customers = customers.filter(u => {
-        // Match non-archived deliveryAddresses
-        if (u.deliveryAddresses.some(a => a.pincode === p && !a.isArchived)) return true;
-        // Legacy fallback when no deliveryAddresses
-        if (u.deliveryAddresses.length === 0 && u.address?.pincode === p) return true;
-        return false;
-      });
-      // Recompute total for accurate pagination when post-filtered (for Mongo, countDocuments already may overcount archived matches)
-      // For correctness, we treat filtered customers length as authoritative for this query type
-      // To keep total accurate, we would need aggregation; for now, use filtered count when pincode filter present
-      // But to avoid breaking pagination total, we compute total via same JS filter on count query (fetch all ids)
-      if (customers.length !== docs.length) {
-        const allMatchingIds = await UserModel.find(query).select('_id').lean().exec();
-        // For total accuracy, we will compute total via JS filtering of all matching docs (limited to pincode case, acceptable for phase 3A scale)
-        const allDocs = await UserModel.find(query).lean().exec();
-        const filteredAll = allDocs.filter((d: unknown) => {
-          const doc = d as { deliveryAddresses?: Array<{ pincode:string; isArchived:boolean }>; address?: { pincode:string } };
-          if (doc.deliveryAddresses?.some(a => a.pincode === p && !a.isArchived)) return true;
-          if ((!doc.deliveryAddresses || doc.deliveryAddresses.length===0) && doc.address?.pincode === p) return true;
-          return false;
-        });
-        return { customers, total: filteredAll.length };
-      }
-    }
+    const customers = docs.map(mapDocToEntity);
     return { customers, total };
   },
 
@@ -1500,7 +1552,8 @@ export const userRepository = {
   async updateAccountStatus(
     id: string,
     status: UserStatus,
-    statusReason?: string
+    statusReason?: string,
+    session?: mongoose.ClientSession
   ): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
@@ -1524,6 +1577,7 @@ export const userRepository = {
     const doc = await UserModel.findByIdAndUpdate(id, updateDoc, {
       new: true,
       runValidators: true,
+      ...(session ? { session } : {}),
     })
       .select('+passwordHash')
       .exec();
@@ -1533,7 +1587,8 @@ export const userRepository = {
 
   async updateCustomerMobile(
     id: string,
-    newMobile: string
+    newMobile: string,
+    session?: mongoose.ClientSession
   ): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
@@ -1544,7 +1599,7 @@ export const userRepository = {
       const doc = await UserModel.findByIdAndUpdate(
         id,
         { $set: { mobileNumber: newMobile }, $inc: { tokenVersion: 1 } },
-        { new: true, runValidators: true }
+        { new: true, runValidators: true, ...(session ? { session } : {}) }
       ).select('+passwordHash').exec();
       return doc ? mapDocToEntity(doc) : null;
     } catch (err: unknown) {
@@ -1554,26 +1609,30 @@ export const userRepository = {
     }
   },
 
-  async addDeliveryAddress(id: string, addr: DeliveryAddress): Promise<UserEntity | null> {
+  async addDeliveryAddress(id: string, addr: DeliveryAddress, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.addDeliveryAddress(id, addr);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findById(id).exec();
+    const findQuery = UserModel.findById(id);
+    if (session) findQuery.session(session);
+    const doc = await findQuery.exec();
     if (!doc) return null;
     const shouldSetActive = !doc.activeDeliveryAddressId;
     const update: Record<string, unknown> = {
       $push: { deliveryAddresses: addr },
     };
     if (shouldSetActive) (update as Record<string, unknown>).$set = { activeDeliveryAddressId: addr.addressId };
-    const updated = await UserModel.findByIdAndUpdate(id, update, { new: true }).select('+passwordHash').exec();
+    const updated = await UserModel.findByIdAndUpdate(id, update, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return updated ? mapDocToEntity(updated) : null;
   },
 
-  async updateDeliveryAddress(id: string, addressId: string, updates: Partial<DeliveryAddress>): Promise<UserEntity | null> {
+  async updateDeliveryAddress(id: string, addressId: string, updates: Partial<DeliveryAddress>, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.updateDeliveryAddress(id, addressId, updates);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findById(id).exec();
+    const findQuery = UserModel.findById(id);
+    if (session) findQuery.session(session);
+    const doc = await findQuery.exec();
     if (!doc) return null;
     const idx = (doc.deliveryAddresses ?? []).findIndex((a: DeliveryAddress) => a.addressId === addressId);
     if (idx===-1) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
@@ -1583,29 +1642,35 @@ export const userRepository = {
     }
     (doc.deliveryAddresses[idx] as unknown as Record<string, unknown>).updatedAt = new Date();
     doc.markModified('deliveryAddresses');
-    await doc.save();
-    const refreshed = await UserModel.findById(id).select('+passwordHash').exec();
+    await doc.save(session ? { session } : undefined);
+    const refreshedQuery = UserModel.findById(id).select('+passwordHash');
+    if (session) refreshedQuery.session(session);
+    const refreshed = await refreshedQuery.exec();
     return refreshed ? mapDocToEntity(refreshed) : null;
   },
 
-  async setActiveDeliveryAddress(id: string, addressId: string): Promise<UserEntity | null> {
+  async setActiveDeliveryAddress(id: string, addressId: string, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.setActiveDeliveryAddress(id, addressId);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findById(id).exec();
+    const findQuery = UserModel.findById(id);
+    if (session) findQuery.session(session);
+    const doc = await findQuery.exec();
     if (!doc) return null;
     const found = (doc.deliveryAddresses ?? []).find((a: DeliveryAddress) => a.addressId === addressId);
     if (!found) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
     if (found.isArchived) throw new AppError(400,'VALIDATION_ERROR','Cannot activate an archived address.');
-    const updated = await UserModel.findByIdAndUpdate(id, { $set: { activeDeliveryAddressId: addressId } }, { new: true }).select('+passwordHash').exec();
+    const updated = await UserModel.findByIdAndUpdate(id, { $set: { activeDeliveryAddressId: addressId } }, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return updated ? mapDocToEntity(updated) : null;
   },
 
-  async archiveDeliveryAddress(id: string, addressId: string): Promise<UserEntity | null> {
+  async archiveDeliveryAddress(id: string, addressId: string, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.archiveDeliveryAddress(id, addressId);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findById(id).exec();
+    const findQuery = UserModel.findById(id);
+    if (session) findQuery.session(session);
+    const doc = await findQuery.exec();
     if (!doc) return null;
     if (doc.activeDeliveryAddressId === addressId) throw new AppError(400,'VALIDATION_ERROR','Cannot archive the active delivery address. Switch active address first.');
     const idx = (doc.deliveryAddresses ?? []).findIndex((a: DeliveryAddress) => a.addressId===addressId);
@@ -1613,40 +1678,42 @@ export const userRepository = {
     doc.deliveryAddresses[idx].isArchived = true;
     doc.deliveryAddresses[idx].updatedAt = new Date();
     doc.markModified('deliveryAddresses');
-    await doc.save();
-    const refreshed = await UserModel.findById(id).select('+passwordHash').exec();
+    await doc.save(session ? { session } : undefined);
+    const refreshedQuery = UserModel.findById(id).select('+passwordHash');
+    if (session) refreshedQuery.session(session);
+    const refreshed = await refreshedQuery.exec();
     return refreshed ? mapDocToEntity(refreshed) : null;
   },
 
-  async updateMilkServiceStatus(id: string, status: MilkServiceStatus): Promise<UserEntity | null> {
+  async updateMilkServiceStatus(id: string, status: MilkServiceStatus, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.updateMilkServiceStatus(id, status);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findByIdAndUpdate(id, { $set: { milkServiceStatus: status } }, { new: true }).select('+passwordHash').exec();
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { milkServiceStatus: status } }, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return doc ? mapDocToEntity(doc) : null;
   },
 
-  async updateProductOrderServiceStatus(id: string, status: ProductOrderServiceStatus): Promise<UserEntity | null> {
+  async updateProductOrderServiceStatus(id: string, status: ProductOrderServiceStatus, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.updateProductOrderServiceStatus(id, status);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findByIdAndUpdate(id, { $set: { productOrderServiceStatus: status } }, { new: true }).select('+passwordHash').exec();
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { productOrderServiceStatus: status } }, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return doc ? mapDocToEntity(doc) : null;
   },
 
-  async updateTags(id: string, tags: string[]): Promise<UserEntity | null> {
+  async updateTags(id: string, tags: string[], session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.updateTags(id, tags);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findByIdAndUpdate(id, { $set: { tags } }, { new: true }).select('+passwordHash').exec();
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { tags } }, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return doc ? mapDocToEntity(doc) : null;
   },
 
-  async setWeeklySchedule(id: string, schedule: WeeklyMilkSchedule): Promise<UserEntity | null> {
+  async setWeeklySchedule(id: string, schedule: WeeklyMilkSchedule, session?: mongoose.ClientSession): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') return inMemoryUserStore.setWeeklySchedule(id, schedule);
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
-    const doc = await UserModel.findByIdAndUpdate(id, { $set: { weeklyMilkSchedule: schedule } }, { new: true }).select('+passwordHash').exec();
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { weeklyMilkSchedule: schedule } }, { new: true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     return doc ? mapDocToEntity(doc) : null;
   },
 
@@ -1697,7 +1764,8 @@ export const userRepository = {
 
   async updateCustomerProfile(
     id: string,
-    updates: UpdateCustomerProfileInput
+    updates: UpdateCustomerProfileInput,
+    session?: mongoose.ClientSession
   ): Promise<UserEntity | null> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
@@ -1715,7 +1783,7 @@ export const userRepository = {
     const doc = await UserModel.findByIdAndUpdate(
       id,
       { $set: updateSet },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true, ...(session ? { session } : {}) }
     )
       .select('+passwordHash')
       .exec();

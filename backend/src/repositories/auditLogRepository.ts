@@ -172,6 +172,15 @@ export class InMemoryAuditLogStore {
     this.logs = [];
     this.saveToDisk();
   }
+
+  public snapshot(): AuditLogEntity[] {
+    this.loadFromDisk();
+    return this.logs.map(l=> ({...l}));
+  }
+  public restore(snapshot: AuditLogEntity[]): void {
+    this.logs = snapshot.map(l=> ({...l}));
+    this.saveToDisk();
+  }
 }
 
 export const inMemoryAuditLogStore = new InMemoryAuditLogStore();
@@ -195,12 +204,25 @@ function assertStoreAvailable(): 'mongo' | 'memory' {
 }
 
 export const auditLogRepository = {
-  async record(input: CreateAuditLogInput): Promise<AuditLogEntity> {
+  async record(input: CreateAuditLogInput, session?: mongoose.ClientSession): Promise<AuditLogEntity> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
       return inMemoryAuditLogStore.record(input);
     }
 
+    if (session) {
+      const docs = await AuditLogModel.create([{
+        action: input.action,
+        actorId: input.actorId,
+        actorRole: input.actorRole,
+        targetUserId: input.targetUserId,
+        targetUserCode: input.targetUserCode,
+        targetRole: input.targetRole,
+        summary: input.summary,
+        metadata: input.metadata ?? {},
+      }], { session });
+      return mapDocToEntity(docs[0] as IAuditLogDocument);
+    }
     const doc = await AuditLogModel.create({
       action: input.action,
       actorId: input.actorId,

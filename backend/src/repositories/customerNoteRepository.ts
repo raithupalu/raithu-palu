@@ -59,6 +59,8 @@ class InMemoryNoteStore {
     return { notes: filtered.slice(start, start+limit).map(n=>({...n})), total };
   }
   clear() { this.notes=[]; this.save(); }
+  snapshot(): CustomerNoteEntity[] { this.load(); return this.notes.map(n=> ({...n})); }
+  restore(snap: CustomerNoteEntity[]) { this.notes = snap.map(n=> ({...n})); this.save(); }
 }
 
 export const inMemoryNoteStore = new InMemoryNoteStore();
