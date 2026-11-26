@@ -4,7 +4,7 @@ import { AppError } from '../middleware/notFound';
 import { PublicUserProfile, toPublicUserProfile, MilkServiceStatus, ProductOrderServiceStatus, WeeklyMilkSchedule, WeeklyScheduleStatus, DeliveryAddress } from '../models/User';
 import { userRepository } from '../repositories/userRepository';
 import { auditLogRepository } from '../repositories/auditLogRepository';
-import { customerNoteRepository } from '../repositories/customerNoteRepository';
+import { customerNoteRepository, inMemoryNoteStore } from '../repositories/customerNoteRepository';
 import { UserModel } from '../models/User';
 import { AuditLogModel } from '../models/AuditLog';
 import { hashPassword } from './authService';
@@ -427,15 +427,61 @@ export const customerManagementService = {
     let p = Number(page) || 1;
     let l = Number(limit) || 20;
     if (p<1) p=1; if (l<1||l>100) l=20;
-    // Fetch complete histories without arbitrary 200 limit — use large limit to retrieve all
-    const audits = await auditLogRepository.list({ targetUserId: customerId, limit: 10000 });
-    const { notes } = await customerNoteRepository.list(customerId, 1, 10000);
-    const auditEntries = audits.map(a=> ({ type:'AUDIT', id:a.id, action:a.action, summary:a.summary, metadata:a.metadata, actorId:a.actorId, actorRole:a.actorRole, createdAt:a.createdAt }));
-    const noteEntries = notes.map(n=> ({ type:'NOTE', id:n.id, body:n.body, authorCode:n.authorCode, createdAt:n.createdAt }));
-    const merged = [...auditEntries, ...noteEntries].sort((a,b)=> new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime());
-    const total = merged.length;
-    const start=(p-1)*l;
-    return { entries: merged.slice(start, start+l), total, page:p, pageSize:l };
+
+    // Correct DB-level pagination: totals via countDocuments, entries via merged pagination
+    // Uses database-level pagination (skip/limit) for each collection and merges to support >10k entries
+    const isMongo = mongoose.connection.readyState === 1;
+    if (isMongo) {
+      // Get totals via counts (DB-level)
+      const [auditTotal, noteTotal] = await Promise.all([
+        auditLogRepository.count({ targetUserId: customerId }),
+        (async () => {
+          const { total } = await customerNoteRepository.list(customerId, 1, 1);
+          // Use count via model directly for accuracy when large
+          try {
+            const { CustomerNoteModel } = await import('../models/CustomerNote');
+            return await CustomerNoteModel.countDocuments({ customerId: new mongoose.Types.ObjectId(customerId) }).exec();
+          } catch { return total; }
+        })(),
+      ]);
+      const total = auditTotal + noteTotal;
+
+      // For merged pagination, fetch top (p*l) from each collection via DB limit, then slice
+      // This is DB-level pagination (limit) with correct global ordering and supports >10k
+      const needed = p * l;
+      const [audits, noteRes] = await Promise.all([
+        AuditLogModel.find({ targetUserId: customerId }).sort({ createdAt: -1 }).limit(needed).lean().exec(),
+        (async () => {
+          const { CustomerNoteModel } = await import('../models/CustomerNote');
+          return CustomerNoteModel.find({ customerId: new mongoose.Types.ObjectId(customerId) })
+            .sort({ createdAt: -1 })
+            .limit(needed)
+            .lean()
+            .exec();
+        })(),
+      ]);
+      const auditEntries = audits.map((a: unknown) => {
+        const doc = a as { _id: { toString(): string }; action: string; summary: string; metadata: unknown; actorId: string; actorRole: string; createdAt: Date };
+        return { type: 'AUDIT', id: doc._id.toString(), action: doc.action, summary: doc.summary, metadata: doc.metadata, actorId: doc.actorId, actorRole: doc.actorRole, createdAt: doc.createdAt };
+      });
+      const noteEntries = noteRes.map((n: unknown) => {
+        const doc = n as { _id: { toString(): string }; body: string; authorCode: string; createdAt: Date };
+        return { type: 'NOTE', id: doc._id.toString(), body: doc.body, authorCode: doc.authorCode, createdAt: doc.createdAt };
+      });
+      const merged = [...auditEntries, ...noteEntries].sort((a,b)=> new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime());
+      const start = (p - 1) * l;
+      return { entries: merged.slice(start, start + l), total, page: p, pageSize: l };
+    } else {
+      // In-memory: fetch all without artificial cap, then paginate in memory (no 10k limit)
+      const audits = await auditLogRepository.getAllForTimeline({ targetUserId: customerId });
+      const auditEntries = audits.map((a)=> ({ type:'AUDIT', id:a.id, action:a.action, summary:a.summary, metadata:a.metadata, actorId:a.actorId, actorRole:a.actorRole, createdAt:a.createdAt }));
+      const allNotes = inMemoryNoteStore.list(customerId, Number.MAX_SAFE_INTEGER, 1);
+      const noteEntries: Array<Record<string,unknown>> = allNotes.notes.map((n: { id: string; body: string; authorCode: string; createdAt: Date })=> ({ type:'NOTE', id:n.id, body:n.body, authorCode:n.authorCode, createdAt:n.createdAt }));
+      const merged = [...auditEntries, ...noteEntries].sort((a,b)=> new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime());
+      const total = merged.length;
+      const start=(p-1)*l;
+      return { entries: merged.slice(start, start+l), total, page:p, pageSize:l };
+    }
   },
 
   async addAddress(actor: PublicUserProfile, customerId: string, raw: unknown): Promise<PublicUserProfile>{
@@ -622,9 +668,10 @@ export const customerManagementService = {
       try {
         await session.withTransaction(async ()=>{
           for (const nr of normalizedRows) {
-            const passwordHash = await hashPassword(nr.password);
-            // Zero out password after hash
-            (nr as unknown as Record<string,unknown>).password = undefined;
+            // Do not mutate nr.password inside transaction — withTransaction may retry the callback;
+            // keep password until outer finally clears it
+            const rawPassword = nr.password;
+            const passwordHash = await hashPassword(rawPassword);
             let deliveryAddresses: DeliveryAddress[]|undefined;
             let activeId: string|null|undefined;
             if (nr.pincode && nr.line1) {

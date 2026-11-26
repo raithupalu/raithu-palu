@@ -139,6 +139,35 @@ export class InMemoryAuditLogStore {
     return filtered.slice(0, limit).map((l) => ({ ...l }));
   }
 
+  public listPaginated(
+    filter: { targetUserId?: string } = {},
+    page = 1,
+    limit = 20
+  ): { logs: AuditLogEntity[]; total: number } {
+    this.loadFromDisk();
+    const filtered = filter.targetUserId
+      ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
+      : this.logs;
+    const sorted = [...filtered].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const total = sorted.length;
+    const start = (page - 1) * limit;
+    return { logs: sorted.slice(start, start + limit).map((l) => ({ ...l })), total };
+  }
+
+  public count(filter: { targetUserId?: string } = {}): number {
+    this.loadFromDisk();
+    if (filter.targetUserId) return this.logs.filter((l) => l.targetUserId === filter.targetUserId).length;
+    return this.logs.length;
+  }
+
+  public getAllForTimeline(filter: { targetUserId?: string } = {}): AuditLogEntity[] {
+    this.loadFromDisk();
+    const filtered = filter.targetUserId
+      ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
+      : this.logs;
+    return [...filtered].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).map((l) => ({ ...l }));
+  }
+
   public clear(): void {
     this.logs = [];
     this.saveToDisk();
@@ -204,6 +233,41 @@ export const auditLogRepository = {
       .limit(filter.limit ?? 50)
       .exec();
 
+    return docs.map(mapDocToEntity);
+  },
+
+  async count(filter: { targetUserId?: string } = {}): Promise<number> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.count(filter);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    return AuditLogModel.countDocuments(query).exec();
+  },
+
+  async listPaginated(
+    filter: { targetUserId?: string } = {},
+    page = 1,
+    limit = 20
+  ): Promise<{ logs: AuditLogEntity[]; total: number }> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.listPaginated(filter, page, limit);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    const total = await AuditLogModel.countDocuments(query).exec();
+    const docs = await AuditLogModel.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .exec();
+    return { logs: docs.map(mapDocToEntity), total };
+  },
+
+  async getAllForTimeline(filter: { targetUserId?: string } = {}): Promise<AuditLogEntity[]> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.getAllForTimeline(filter);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    const docs = await AuditLogModel.find(query).sort({ createdAt: -1 }).exec();
     return docs.map(mapDocToEntity);
   },
 };
