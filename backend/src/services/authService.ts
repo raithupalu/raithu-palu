@@ -1,15 +1,17 @@
-import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import jwt, { SignOptions } from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../middleware/notFound';
 import {
+  CustomerAddress,
   PublicUserProfile,
   toPublicUserProfile,
   UserEntity,
   UserRole,
 } from '../models/User';
 import { userRepository } from '../repositories/userRepository';
+import { auditLogRepository } from '../repositories/auditLogRepository';
 import {
   normalizeAndValidateMobileNumber,
   validateCustomerAddress,
@@ -20,6 +22,7 @@ import {
 export interface JwtAccessPayload {
   sub: string;
   role: UserRole;
+  mobileNumber: string;
   tokenVersion: number;
   jti: string;
   iat?: number;
@@ -32,17 +35,12 @@ export interface AuthSessionResult {
   expiresIn: string;
 }
 
-// Precomputed bcrypt hash used when user does not exist to mitigate timing enumeration
-const DUMMY_PASSWORD_HASH =
-  '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
-
-// In-memory revoked token JTI registry (maps jti -> exp unix timestamp in seconds)
 const revokedTokenJtis = new Map<string, number>();
 
-function pruneExpiredRevokedTokens(): void {
+function pruneExpiredRevokedJtis(): void {
   const nowSec = Math.floor(Date.now() / 1000);
-  for (const [jti, expSec] of revokedTokenJtis.entries()) {
-    if (expSec <= nowSec) {
+  for (const [jti, exp] of revokedTokenJtis.entries()) {
+    if (exp <= nowSec) {
       revokedTokenJtis.delete(jti);
     }
   }
@@ -63,30 +61,35 @@ export function signAccessToken(user: UserEntity): string {
   const payload: JwtAccessPayload = {
     sub: user.id,
     role: user.role,
+    mobileNumber: user.mobileNumber,
     tokenVersion: user.tokenVersion,
     jti: crypto.randomUUID(),
   };
 
-  const signOptions: SignOptions = {
+  const options: SignOptions = {
     expiresIn: env.JWT_EXPIRES_IN as SignOptions['expiresIn'],
-    issuer: 'raithu-palu-backend',
+    issuer: 'raithu-palu-api',
     audience: 'raithu-palu-client',
   };
 
-  return jwt.sign(payload, env.JWT_SECRET, signOptions);
+  return jwt.sign(payload, env.JWT_SECRET, options);
 }
 
 export function verifyAccessToken(token: string): JwtAccessPayload {
-  pruneExpiredRevokedTokens();
+  pruneExpiredRevokedJtis();
 
   try {
     const decoded = jwt.verify(token, env.JWT_SECRET, {
-      issuer: 'raithu-palu-backend',
+      issuer: 'raithu-palu-api',
       audience: 'raithu-palu-client',
     }) as JwtAccessPayload;
 
     if (!decoded || typeof decoded.sub !== 'string' || !decoded.jti) {
-      throw new AppError(401, 'INVALID_TOKEN', 'Invalid authentication token.');
+      throw new AppError(
+        401,
+        'INVALID_TOKEN',
+        'Invalid authentication token payload.'
+      );
     }
 
     if (revokedTokenJtis.has(decoded.jti)) {
@@ -111,29 +114,71 @@ export function verifyAccessToken(token: string): JwtAccessPayload {
 }
 
 export function revokeTokenJti(jti: string, exp?: number): void {
-  const expirySec = exp ?? Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
-  revokedTokenJtis.set(jti, expirySec);
+  const expiryEpoch = exp ?? Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+  revokedTokenJtis.set(jti, expiryEpoch);
 }
 
 export const authService = {
-  async registerCustomer(body: Record<string, unknown>): Promise<AuthSessionResult> {
-    if (
-      body.role !== undefined &&
-      String(body.role).toUpperCase() !== 'CUSTOMER'
-    ) {
-      throw new AppError(
-        403,
-        'FORBIDDEN_ROLE_ASSIGNMENT',
-        'Public registration is restricted to CUSTOMER accounts only.'
-      );
-    }
+  /**
+   * Manual Admin Provisioning by an Authorized Technical Operator.
+   * Never exposed via any public registration route.
+   */
+  async provisionOperatorAdmin(rawInput: {
+    fullName: unknown;
+    mobileNumber: unknown;
+    password: unknown;
+  }): Promise<{ user: PublicUserProfile; created: boolean }> {
+    const fullName = validateFullName(rawInput.fullName);
+    const mobileNumber = normalizeAndValidateMobileNumber(
+      rawInput.mobileNumber,
+      'Admin mobile number'
+    );
+    const password = validatePasswordStrength(rawInput.password);
+    const passwordHash = await hashPassword(password);
 
-    const fullName = validateFullName(body.fullName);
-    const mobileNumber = normalizeAndValidateMobileNumber(body.mobileNumber);
-    const password = validatePasswordStrength(body.password);
-    const address = validateCustomerAddress(body.address);
+    const { user, created } = await userRepository.provisionAdmin({
+      fullName,
+      mobileNumber,
+      passwordHash,
+    });
 
-    const existing = await userRepository.findByMobileWithPassword(mobileNumber);
+    await auditLogRepository.record({
+      action: 'ADMIN_PROVISIONED',
+      actorId: 'SYSTEM_OPERATOR',
+      actorRole: 'SYSTEM_OPERATOR',
+      targetUserId: user.id,
+      targetUserCode: user.userCode,
+      targetRole: 'ADMIN',
+      summary: created
+        ? `Provisioned Admin account ${user.userCode} (${user.fullName}) via operator provisioning.`
+        : `Updated existing Admin account ${user.userCode} (${user.fullName}) via operator provisioning.`,
+      metadata: {
+        created,
+        mobileNumber: user.mobileNumber,
+      },
+    });
+
+    return {
+      user: toPublicUserProfile(user),
+      created,
+    };
+  },
+
+  async registerCustomer(rawInput: {
+    fullName: unknown;
+    mobileNumber: unknown;
+    password: unknown;
+    address?: unknown;
+  }): Promise<AuthSessionResult> {
+    const fullName = validateFullName(rawInput.fullName);
+    const mobileNumber = normalizeAndValidateMobileNumber(
+      rawInput.mobileNumber
+    );
+    const password = validatePasswordStrength(rawInput.password);
+    const address = validateCustomerAddress(rawInput.address);
+
+    const existing =
+      await userRepository.findByMobileWithPassword(mobileNumber);
     if (existing) {
       throw new AppError(
         409,
@@ -143,7 +188,6 @@ export const authService = {
     }
 
     const passwordHash = await hashPassword(password);
-
     const createdUser = await userRepository.createCustomer({
       fullName,
       mobileNumber,
@@ -152,7 +196,6 @@ export const authService = {
     });
 
     const accessToken = signAccessToken(createdUser);
-
     return {
       user: toPublicUserProfile(createdUser),
       accessToken,
@@ -160,20 +203,22 @@ export const authService = {
     };
   },
 
-  async loginCustomer(body: Record<string, unknown>): Promise<AuthSessionResult> {
-    const mobileNumber = normalizeAndValidateMobileNumber(body.mobileNumber);
-
-    if (typeof body.password !== 'string' || body.password.length === 0) {
-      throw new AppError(
-        400,
-        'VALIDATION_ERROR',
-        'Password is required.'
-      );
+  async loginWithRoleCheck(
+    rawInput: {
+      mobileNumber: unknown;
+      password: unknown;
+    },
+    allowedRoles?: UserRole[]
+  ): Promise<AuthSessionResult> {
+    const mobileNumber = normalizeAndValidateMobileNumber(
+      rawInput.mobileNumber
+    );
+    if (typeof rawInput.password !== 'string' || !rawInput.password) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Password is required.');
     }
 
     const user = await userRepository.findByMobileWithPassword(mobileNumber);
     if (!user) {
-      await verifyPassword(body.password, DUMMY_PASSWORD_HASH);
       throw new AppError(
         401,
         'INVALID_CREDENTIALS',
@@ -181,15 +226,27 @@ export const authService = {
       );
     }
 
-    const passwordMatches = await verifyPassword(
-      body.password,
+    const isPasswordValid = await verifyPassword(
+      rawInput.password,
       user.passwordHash
     );
-    if (!passwordMatches) {
+    if (!isPasswordValid) {
       throw new AppError(
         401,
         'INVALID_CREDENTIALS',
         'Invalid mobile number or password.'
+      );
+    }
+
+    if (allowedRoles && !allowedRoles.includes(user.role)) {
+      throw new AppError(
+        403,
+        'ROLE_FORBIDDEN',
+        allowedRoles.length === 1 && allowedRoles[0] === 'CUSTOMER'
+          ? 'This login endpoint is restricted to Customer accounts.'
+          : allowedRoles.length === 1 && allowedRoles[0] === 'ADMIN'
+            ? 'This login endpoint is restricted to Admin accounts.'
+            : `Access denied. Required role: ${allowedRoles.join(' or ')}.`
       );
     }
 
@@ -197,15 +254,7 @@ export const authService = {
       throw new AppError(
         403,
         'ACCOUNT_INACTIVE',
-        `Your account status is ${user.status}. Please contact Raithu Palu support.`
-      );
-    }
-
-    if (user.role !== 'CUSTOMER') {
-      throw new AppError(
-        403,
-        'ROLE_FORBIDDEN',
-        'This login endpoint is restricted to Customer accounts.'
+        `Your account status is ${user.status}. Please contact support.`
       );
     }
 
@@ -219,15 +268,52 @@ export const authService = {
     };
   },
 
-  async logoutSession(payload: JwtAccessPayload): Promise<void> {
-    revokeTokenJti(payload.jti, payload.exp);
-    await userRepository.recordLogout(payload.sub);
+  async loginCustomer(rawInput: {
+    mobileNumber: unknown;
+    password: unknown;
+  }): Promise<AuthSessionResult> {
+    return this.loginWithRoleCheck(rawInput, ['CUSTOMER']);
   },
 
-  async getAuthenticatedCustomerProfile(userId: string): Promise<PublicUserProfile> {
+  async loginAdmin(rawInput: {
+    mobileNumber: unknown;
+    password: unknown;
+  }): Promise<AuthSessionResult> {
+    return this.loginWithRoleCheck(rawInput, ['ADMIN']);
+  },
+
+  async loginAnyRole(rawInput: {
+    mobileNumber: unknown;
+    password: unknown;
+  }): Promise<AuthSessionResult> {
+    return this.loginWithRoleCheck(rawInput);
+  },
+
+  async logoutSession(
+    userId: string,
+    tokenPayload?: JwtAccessPayload
+  ): Promise<void> {
+    if (tokenPayload?.jti) {
+      revokeTokenJti(tokenPayload.jti, tokenPayload.exp);
+    }
+    await userRepository.recordLogout(userId);
+  },
+
+  async getCustomerProfile(userId: string): Promise<PublicUserProfile> {
     const user = await userRepository.findById(userId);
     if (!user) {
-      throw new AppError(404, 'USER_NOT_FOUND', 'Customer account not found.');
+      throw new AppError(
+        404,
+        'USER_NOT_FOUND',
+        'Customer profile was not found.'
+      );
+    }
+    if (user.role !== 'CUSTOMER') {
+      throw new AppError(
+        403,
+        'FORBIDDEN_ROLE',
+        'Profile endpoint is restricted to Customer accounts.'
+      );
     }
     if (user.status !== 'ACTIVE') {
       throw new AppError(
@@ -239,51 +325,93 @@ export const authService = {
     return toPublicUserProfile(user);
   },
 
-  async updateAuthenticatedCustomerProfile(
-    userId: string,
-    body: Record<string, unknown>
+  async getAuthenticatedCustomerProfile(
+    userId: string
   ): Promise<PublicUserProfile> {
-    const forbiddenFields = [
+    return this.getCustomerProfile(userId);
+  },
+
+  async getAuthenticatedSessionProfile(
+    userId: string
+  ): Promise<PublicUserProfile> {
+    const user = await userRepository.findById(userId);
+    if (!user) {
+      throw new AppError(
+        404,
+        'USER_NOT_FOUND',
+        'Authenticated user profile was not found.'
+      );
+    }
+    if (user.status !== 'ACTIVE') {
+      throw new AppError(
+        403,
+        'ACCOUNT_INACTIVE',
+        `Your account status is ${user.status}.`
+      );
+    }
+    return toPublicUserProfile(user);
+  },
+
+  async updateCustomerProfile(
+    userId: string,
+    rawUpdates: Record<string, unknown>
+  ): Promise<PublicUserProfile> {
+    const forbiddenKeys = [
       'role',
       'status',
+      'mobileNumber',
       'password',
       'passwordHash',
-      'mobileNumber',
       'tokenVersion',
+      'userCode',
+      'staffPermissions',
+      'farmerProfile',
+      'grazingWorkerProfile',
     ];
-    for (const field of forbiddenFields) {
-      if (body[field] !== undefined) {
+    for (const key of forbiddenKeys) {
+      if (key in rawUpdates) {
         throw new AppError(
           400,
           'IMMUTABLE_PROFILE_FIELD',
-          `Field "${field}" cannot be modified via customer profile update.`
+          `Field "${key}" cannot be modified through the profile update endpoint.`
         );
       }
     }
 
-    const fullName =
-      body.fullName !== undefined ? validateFullName(body.fullName) : undefined;
-    const address =
-      body.address !== undefined
-        ? validateCustomerAddress(body.address)
-        : undefined;
+    const updates: { fullName?: string; address?: CustomerAddress } = {};
 
-    if (fullName === undefined && address === undefined) {
+    if (rawUpdates.fullName !== undefined) {
+      updates.fullName = validateFullName(rawUpdates.fullName);
+    }
+
+    if (rawUpdates.address !== undefined) {
+      updates.address = validateCustomerAddress(rawUpdates.address);
+    }
+
+    if (Object.keys(updates).length === 0) {
       throw new AppError(
         400,
         'VALIDATION_ERROR',
-        'Provide at least one updatable field (fullName or address).'
+        'At least one valid profile field (fullName or address) must be provided for update.'
       );
     }
 
-    const updated = await userRepository.updateCustomerProfile(userId, {
-      fullName,
-      address,
-    });
+    const updated = await userRepository.updateCustomerProfile(userId, updates);
     if (!updated) {
-      throw new AppError(404, 'USER_NOT_FOUND', 'Customer account not found.');
+      throw new AppError(
+        404,
+        'USER_NOT_FOUND',
+        'Customer account was not found.'
+      );
     }
 
     return toPublicUserProfile(updated);
+  },
+
+  async updateAuthenticatedCustomerProfile(
+    userId: string,
+    rawUpdates: Record<string, unknown>
+  ): Promise<PublicUserProfile> {
+    return this.updateCustomerProfile(userId, rawUpdates);
   },
 };

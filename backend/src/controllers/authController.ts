@@ -1,50 +1,32 @@
 import { Request, Response, NextFunction, CookieOptions } from 'express';
-import { env } from '../config/env';
-import { AUTH_COOKIE_NAME } from '../middleware/authMiddleware';
 import { AppError } from '../middleware/notFound';
+import { AUTH_COOKIE_NAME } from '../middleware/authMiddleware';
 import { authService } from '../services/authService';
+import { env } from '../config/env';
 
-function isHttpsRequest(req: Request): boolean {
-  if (req.secure || env.NODE_ENV === 'production') {
+function isSecureRequest(req: Request): boolean {
+  if (env.NODE_ENV === 'production') {
+    return true;
+  }
+  if (req.secure) {
     return true;
   }
   const forwardedProto = req.headers['x-forwarded-proto'];
   if (typeof forwardedProto === 'string') {
-    return forwardedProto
-      .split(',')
-      .map((p) => p.trim().toLowerCase())
-      .includes('https');
-  }
-  if (Array.isArray(forwardedProto)) {
-    return forwardedProto.some((p) => p.toLowerCase().includes('https'));
+    return forwardedProto.split(',')[0].trim().toLowerCase() === 'https';
   }
   return false;
 }
 
 function buildCookieOptions(req: Request): CookieOptions {
-  const https = isHttpsRequest(req);
+  const secure = isSecureRequest(req);
   return {
     httpOnly: true,
-    sameSite: https ? 'none' : 'lax',
-    secure: https,
+    secure,
+    sameSite: secure ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    ...(https ? ({ partitioned: true } as Partial<CookieOptions>) : {}),
   };
-}
-
-function setAuthCookie(req: Request, res: Response, token: string): void {
-  res.cookie(AUTH_COOKIE_NAME, token, buildCookieOptions(req));
-}
-
-function clearAuthCookie(req: Request, res: Response): void {
-  const https = isHttpsRequest(req);
-  res.clearCookie(AUTH_COOKIE_NAME, {
-    httpOnly: true,
-    sameSite: https ? 'none' : 'lax',
-    secure: https,
-    path: '/',
-  });
 }
 
 export const authController = {
@@ -54,25 +36,35 @@ export const authController = {
     next: NextFunction
   ): Promise<void> {
     try {
-      const body =
-        req.body && typeof req.body === 'object'
-          ? (req.body as Record<string, unknown>)
-          : {};
+      const body = (req.body ?? {}) as Record<string, unknown>;
 
-      const session = await authService.registerCustomer(body);
-      setAuthCookie(req, res, session.accessToken);
+      if (body.role !== undefined && body.role !== 'CUSTOMER') {
+        throw new AppError(
+          403,
+          'FORBIDDEN_ROLE_ASSIGNMENT',
+          'Public registration is permitted only for Customer accounts.'
+        );
+      }
+
+      const session = await authService.registerCustomer({
+        fullName: body.fullName,
+        mobileNumber: body.mobileNumber,
+        password: body.password,
+        address: body.address,
+      });
+
+      res.cookie(
+        AUTH_COOKIE_NAME,
+        session.accessToken,
+        buildCookieOptions(req)
+      );
 
       res.status(201).json({
         status: 'ok',
         message: 'Customer account registered successfully.',
-        user: session.user,
         accessToken: session.accessToken,
-        expiresIn: session.expiresIn,
-        data: {
-          user: session.user,
-          accessToken: session.accessToken,
-          expiresIn: session.expiresIn,
-        },
+        user: session.user,
+        data: session,
       });
     } catch (err) {
       next(err);
@@ -85,47 +77,106 @@ export const authController = {
     next: NextFunction
   ): Promise<void> {
     try {
-      const body =
-        req.body && typeof req.body === 'object'
-          ? (req.body as Record<string, unknown>)
-          : {};
+      const body = (req.body ?? {}) as Record<string, unknown>;
 
-      const session = await authService.loginCustomer(body);
-      setAuthCookie(req, res, session.accessToken);
+      const session = await authService.loginCustomer({
+        mobileNumber: body.mobileNumber,
+        password: body.password,
+      });
+
+      res.cookie(
+        AUTH_COOKIE_NAME,
+        session.accessToken,
+        buildCookieOptions(req)
+      );
 
       res.status(200).json({
         status: 'ok',
         message: 'Customer logged in successfully.',
-        user: session.user,
         accessToken: session.accessToken,
-        expiresIn: session.expiresIn,
-        data: {
-          user: session.user,
-          accessToken: session.accessToken,
-          expiresIn: session.expiresIn,
-        },
+        user: session.user,
+        data: session,
       });
     } catch (err) {
       next(err);
     }
   },
 
-  async logout(
+  async loginAdmin(
     req: Request,
     res: Response,
     next: NextFunction
   ): Promise<void> {
     try {
-      if (!req.authTokenPayload) {
-        throw new AppError(
-          401,
-          'AUTHENTICATION_REQUIRED',
-          'Authentication is required to log out.'
-        );
+      const body = (req.body ?? {}) as Record<string, unknown>;
+
+      const session = await authService.loginAdmin({
+        mobileNumber: body.mobileNumber,
+        password: body.password,
+      });
+
+      res.cookie(
+        AUTH_COOKIE_NAME,
+        session.accessToken,
+        buildCookieOptions(req)
+      );
+
+      res.status(200).json({
+        status: 'ok',
+        message: 'Admin logged in successfully.',
+        accessToken: session.accessToken,
+        user: session.user,
+        data: session,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async loginAnyRole(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+
+      const session = await authService.loginAnyRole({
+        mobileNumber: body.mobileNumber,
+        password: body.password,
+      });
+
+      res.cookie(
+        AUTH_COOKIE_NAME,
+        session.accessToken,
+        buildCookieOptions(req)
+      );
+
+      res.status(200).json({
+        status: 'ok',
+        message: 'Logged in successfully.',
+        accessToken: session.accessToken,
+        user: session.user,
+        data: session,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async logout(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (req.authUser) {
+        await authService.logoutSession(req.authUser.id, req.authTokenPayload);
       }
 
-      await authService.logoutSession(req.authTokenPayload);
-      clearAuthCookie(req, res);
+      const secure = isSecureRequest(req);
+      res.clearCookie(AUTH_COOKIE_NAME, {
+        httpOnly: true,
+        secure,
+        sameSite: secure ? 'none' : 'lax',
+        path: '/',
+      });
 
       res.status(200).json({
         status: 'ok',
@@ -136,7 +187,7 @@ export const authController = {
     }
   },
 
-  async getCurrentSession(
+  async getSession(
     req: Request,
     res: Response,
     next: NextFunction
@@ -150,16 +201,97 @@ export const authController = {
         );
       }
 
-      const profile = await authService.getAuthenticatedCustomerProfile(
+      const profile = await authService.getAuthenticatedSessionProfile(
         req.authUser.id
+      );
+      res.status(200).json({
+        status: 'ok',
+        data: {
+          user: profile,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async getCustomerProfile(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      if (!req.authUser) {
+        throw new AppError(
+          401,
+          'AUTHENTICATION_REQUIRED',
+          'Authentication is required.'
+        );
+      }
+
+      const profile = await authService.getCustomerProfile(req.authUser.id);
+      res.status(200).json({
+        status: 'ok',
+        data: {
+          profile,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async updateCustomerProfile(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      if (!req.authUser) {
+        throw new AppError(
+          401,
+          'AUTHENTICATION_REQUIRED',
+          'Authentication is required.'
+        );
+      }
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+
+      const forbiddenKeys = [
+        'role',
+        'status',
+        'mobileNumber',
+        'password',
+        'passwordHash',
+        'tokenVersion',
+        'userCode',
+        'staffPermissions',
+        'farmerProfile',
+        'grazingWorkerProfile',
+      ];
+      for (const key of forbiddenKeys) {
+        if (key in body) {
+          throw new AppError(
+            400,
+            'IMMUTABLE_PROFILE_FIELD',
+            `Field "${key}" cannot be modified through the profile update endpoint.`
+          );
+        }
+      }
+
+      const updatedProfile = await authService.updateCustomerProfile(
+        req.authUser.id,
+        {
+          fullName: body.fullName,
+          address: body.address,
+        }
       );
 
       res.status(200).json({
         status: 'ok',
-        user: profile,
+        message: 'Customer profile updated successfully.',
         data: {
-          user: profile,
-          profile,
+          profile: updatedProfile,
         },
       });
     } catch (err) {

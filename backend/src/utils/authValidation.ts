@@ -1,19 +1,37 @@
 import { AppError } from '../middleware/notFound';
-import { CustomerAddress } from '../models/User';
+import {
+  CustomerAddress,
+  ManagedUserRole,
+  UserStatus,
+  VALID_USER_STATUSES,
+  StaffPermission,
+  APPROVED_STAFF_PERMISSIONS,
+  FarmerProfile,
+  GrazingWorkerProfile,
+  MilkType,
+} from '../models/User';
 
 const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
 const PINCODE_REGEX = /^\d{6}$/;
 
-export function normalizeAndValidateMobileNumber(rawMobile: unknown): string {
+const PERMITTED_MANAGED_ROLES: readonly ManagedUserRole[] = [
+  'STAFF',
+  'FARMER',
+  'GRAZING_WORKER',
+];
+
+export function normalizeAndValidateMobileNumber(
+  rawMobile: unknown,
+  fieldLabel = 'Mobile number'
+): string {
   if (typeof rawMobile !== 'string') {
     throw new AppError(
       400,
       'VALIDATION_ERROR',
-      'Mobile number is required and must be a string.'
+      `${fieldLabel} is required and must be a string.`
     );
   }
 
-  // Strip whitespace, hyphens, and optional +91 / 91 prefix if 12 digits
   let cleaned = rawMobile.replace(/[\s\-()]/g, '');
   if (cleaned.startsWith('+91') && cleaned.length === 13) {
     cleaned = cleaned.slice(3);
@@ -27,7 +45,7 @@ export function normalizeAndValidateMobileNumber(rawMobile: unknown): string {
     throw new AppError(
       400,
       'VALIDATION_ERROR',
-      'Mobile number must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9.'
+      `${fieldLabel} must be a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9.`
     );
   }
 
@@ -83,6 +101,228 @@ export function validatePasswordStrength(rawPassword: unknown): string {
   }
 
   return rawPassword;
+}
+
+export function validateManagedRole(rawRole: unknown): ManagedUserRole {
+  if (typeof rawRole !== 'string') {
+    throw new AppError(
+      400,
+      'INVALID_ROLE',
+      'Account role is required and must be one of STAFF, FARMER, or GRAZING_WORKER.'
+    );
+  }
+
+  const normalized = rawRole.trim().toUpperCase();
+  if (normalized === 'ADMIN') {
+    throw new AppError(
+      403,
+      'INVALID_ROLE',
+      'Admin accounts cannot be created through account management APIs. Admin accounts must be provisioned manually by an authorized technical operator.'
+    );
+  }
+
+  if (!PERMITTED_MANAGED_ROLES.includes(normalized as ManagedUserRole)) {
+    throw new AppError(
+      400,
+      'INVALID_ROLE',
+      `Invalid role "${rawRole}". Admin account management supports STAFF, FARMER, and GRAZING_WORKER only.`
+    );
+  }
+
+  return normalized as ManagedUserRole;
+}
+
+export function validateAccountStatus(rawStatus: unknown): UserStatus {
+  if (typeof rawStatus !== 'string') {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'Account status is required and must be one of ACTIVE, INACTIVE, SUSPENDED, or BLOCKED.'
+    );
+  }
+
+  const normalized = rawStatus.trim().toUpperCase();
+  if (!VALID_USER_STATUSES.includes(normalized as UserStatus)) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Invalid status "${rawStatus}". Allowed statuses are ACTIVE, INACTIVE, SUSPENDED, and BLOCKED.`
+    );
+  }
+
+  return normalized as UserStatus;
+}
+
+export function validateStaffPermissions(
+  rawPermissions: unknown
+): StaffPermission[] {
+  if (rawPermissions === undefined || rawPermissions === null) {
+    return [];
+  }
+
+  if (!Array.isArray(rawPermissions)) {
+    throw new AppError(
+      400,
+      'INVALID_STAFF_PERMISSION',
+      'staffPermissions must be an array of approved view-only permission strings.'
+    );
+  }
+
+  const uniquePermissions = new Set<StaffPermission>();
+  for (const item of rawPermissions) {
+    if (typeof item !== 'string') {
+      throw new AppError(
+        400,
+        'INVALID_STAFF_PERMISSION',
+        'Each staff permission must be a string.'
+      );
+    }
+    const normalized = item.trim().toUpperCase();
+    if (
+      !APPROVED_STAFF_PERMISSIONS.includes(normalized as StaffPermission)
+    ) {
+      throw new AppError(
+        400,
+        'INVALID_STAFF_PERMISSION',
+        `Unapproved staff permission "${item}". Staff accounts are strictly view-only and may only hold approved VIEW_* permissions.`
+      );
+    }
+    uniquePermissions.add(normalized as StaffPermission);
+  }
+
+  return Array.from(uniquePermissions);
+}
+
+export function validateFarmerProfile(
+  rawProfile: unknown,
+  topLevelBusinessContactMobile?: unknown
+): FarmerProfile {
+  const profileObj =
+    rawProfile && typeof rawProfile === 'object' && !Array.isArray(rawProfile)
+      ? (rawProfile as Record<string, unknown>)
+      : {};
+
+  const rawBusinessMobile =
+    profileObj.businessContactMobile ?? topLevelBusinessContactMobile;
+
+  const businessContactMobile = normalizeAndValidateMobileNumber(
+    rawBusinessMobile,
+    'Farmer business contact mobile number'
+  );
+
+  let villageOrLocation: string | undefined;
+  if (
+    profileObj.villageOrLocation !== undefined &&
+    profileObj.villageOrLocation !== null &&
+    profileObj.villageOrLocation !== ''
+  ) {
+    if (typeof profileObj.villageOrLocation !== 'string') {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'Farmer villageOrLocation must be a string.'
+      );
+    }
+    const trimmed = profileObj.villageOrLocation.trim();
+    if (trimmed.length > 120) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'Farmer villageOrLocation cannot exceed 120 characters.'
+      );
+    }
+    villageOrLocation = trimmed || undefined;
+  }
+
+  let suppliedMilkTypes: MilkType[] = ['BUFFALO'];
+  if (profileObj.suppliedMilkTypes !== undefined) {
+    if (
+      !Array.isArray(profileObj.suppliedMilkTypes) ||
+      profileObj.suppliedMilkTypes.length === 0
+    ) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'suppliedMilkTypes must be a non-empty array of BUFFALO and/or COW.'
+      );
+    }
+    const validMilkSet = new Set<MilkType>();
+    for (const m of profileObj.suppliedMilkTypes) {
+      if (m !== 'BUFFALO' && m !== 'COW') {
+        throw new AppError(
+          400,
+          'VALIDATION_ERROR',
+          `Invalid milk type "${String(m)}". Allowed values are BUFFALO and COW.`
+        );
+      }
+      validMilkSet.add(m);
+    }
+    suppliedMilkTypes = Array.from(validMilkSet);
+  }
+
+  return {
+    businessContactMobile,
+    villageOrLocation,
+    suppliedMilkTypes,
+  };
+}
+
+export function validateGrazingWorkerProfile(
+  rawProfile: unknown
+): GrazingWorkerProfile | undefined {
+  if (rawProfile === undefined || rawProfile === null) {
+    return undefined;
+  }
+
+  if (typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'grazingWorkerProfile must be a valid object.'
+    );
+  }
+
+  const profileObj = rawProfile as Record<string, unknown>;
+  let emergencyContactMobile: string | undefined;
+  if (
+    profileObj.emergencyContactMobile !== undefined &&
+    profileObj.emergencyContactMobile !== null &&
+    profileObj.emergencyContactMobile !== ''
+  ) {
+    emergencyContactMobile = normalizeAndValidateMobileNumber(
+      profileObj.emergencyContactMobile,
+      'Emergency contact mobile number'
+    );
+  }
+
+  let assignedNotes: string | undefined;
+  if (
+    profileObj.assignedNotes !== undefined &&
+    profileObj.assignedNotes !== null &&
+    profileObj.assignedNotes !== ''
+  ) {
+    if (typeof profileObj.assignedNotes !== 'string') {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'assignedNotes must be a string.'
+      );
+    }
+    const trimmed = profileObj.assignedNotes.trim();
+    if (trimmed.length > 250) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'assignedNotes cannot exceed 250 characters.'
+      );
+    }
+    assignedNotes = trimmed || undefined;
+  }
+
+  return {
+    emergencyContactMobile,
+    assignedNotes,
+  };
 }
 
 export function validateCustomerAddress(

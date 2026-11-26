@@ -16,7 +16,9 @@ import {
   isPlausibleJwt,
   registerCustomerApi,
   loginCustomerApi,
+  loginAdminApi,
   logoutCustomerApi,
+  fetchSessionUserApi,
   fetchCustomerProfileApi,
   updateCustomerProfileApi,
 } from '../lib/authApi';
@@ -104,6 +106,7 @@ interface AuthContextValue {
   clearSessionError: () => void;
   register: (payload: RegisterCustomerPayload) => Promise<CustomerProfile>;
   login: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
+  loginAdmin: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<CustomerProfile>;
   updateProfile: (payload: UpdateProfilePayload) => Promise<CustomerProfile>;
@@ -141,7 +144,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async function restoreInitialSession() {
       const initialToken = tokenRef.current ?? readStoredToken();
 
-      // Fresh application load without a stored token: do not fire an unauthenticated /api/customer/profile request
+      // Fresh application load without a stored token: do not fire an unauthenticated session request
       if (!initialToken) {
         if (active && sessionEpochRef.current === effectEpoch) {
           setUser(null);
@@ -155,7 +158,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setIsLoading(true);
 
       try {
-        const profile = await fetchCustomerProfileApi(initialToken);
+        const profile = await fetchSessionUserApi(initialToken);
         if (active && sessionEpochRef.current === effectEpoch) {
           setUser(profile);
           setSessionError(null);
@@ -173,7 +176,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSessionError(
             err instanceof Error
               ? err.message
-              : 'Unable to verify customer session at this moment.'
+              : 'Unable to verify session at this moment.'
           );
         }
       } finally {
@@ -226,6 +229,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [persistToken]
   );
 
+  const loginAdmin = useCallback(
+    async (payload: LoginCustomerPayload): Promise<CustomerProfile> => {
+      sessionEpochRef.current += 1;
+      setIsLoading(true);
+      setSessionError(null);
+      try {
+        const response = await loginAdminApi(payload);
+        persistToken(response.data.accessToken);
+        setUser(response.data.user);
+        setIsInitializing(false);
+        return response.data.user;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [persistToken]
+  );
+
   const logout = useCallback(async (): Promise<void> => {
     sessionEpochRef.current += 1;
     setIsLoading(true);
@@ -247,7 +268,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setIsLoading(true);
     setSessionError(null);
     try {
-      const profile = await fetchCustomerProfileApi(currentToken);
+      const profile =
+        user?.role === 'CUSTOMER'
+          ? await fetchCustomerProfileApi(currentToken)
+          : await fetchSessionUserApi(currentToken);
       setUser(profile);
       return profile;
     } catch (err) {
@@ -263,14 +287,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSessionError(
           err instanceof Error
             ? err.message
-            : 'Unable to refresh customer profile.'
+            : 'Unable to refresh user profile.'
         );
       }
       throw err;
     } finally {
       setIsLoading(false);
     }
-  }, [accessToken, persistToken]);
+  }, [accessToken, persistToken, user?.role]);
 
   const updateProfile = useCallback(
     async (payload: UpdateProfilePayload): Promise<CustomerProfile> => {
@@ -295,6 +319,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         clearSessionError,
         register,
         login,
+        loginAdmin,
         logout,
         refreshProfile,
         updateProfile,

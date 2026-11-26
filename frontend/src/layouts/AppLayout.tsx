@@ -14,8 +14,9 @@ export function AppLayout() {
     }`;
 
   async function handleHeaderLogout() {
+    const wasAdmin = user?.role === 'ADMIN';
     await logout();
-    navigate('/login', { replace: true });
+    navigate(wasAdmin ? '/admin/login' : '/login', { replace: true });
   }
 
   return (
@@ -32,7 +33,7 @@ export function AppLayout() {
                   {apiConfig.appName}
                 </span>
                 <span className="rounded-full bg-dairy-meadow px-2.5 py-0.5 text-xs font-semibold text-dairy-pasture">
-                  Phase 1 &bull; Step 1
+                  Phase 1 &bull; Step 2
                 </span>
               </div>
               <p className="text-xs text-slate-500">
@@ -54,9 +55,15 @@ export function AppLayout() {
 
             {isAuthenticated && user ? (
               <>
-                <NavLink to="/customer/profile" className={navLinkClass}>
-                  Customer Profile ({user.fullName.split(' ')[0]})
-                </NavLink>
+                {user.role === 'ADMIN' ? (
+                  <NavLink to="/admin/accounts" className={navLinkClass}>
+                    Admin Accounts ({user.userCode ?? 'ADM'})
+                  </NavLink>
+                ) : (
+                  <NavLink to="/customer/profile" className={navLinkClass}>
+                    Customer Profile ({user.fullName.split(' ')[0]})
+                  </NavLink>
+                )}
                 <button
                   type="button"
                   onClick={() => void handleHeaderLogout()}
@@ -73,6 +80,9 @@ export function AppLayout() {
                 <NavLink to="/register" className={navLinkClass}>
                   Register
                 </NavLink>
+                <NavLink to="/admin/login" className={navLinkClass}>
+                  Admin Console
+                </NavLink>
               </>
             )}
           </nav>
@@ -86,12 +96,18 @@ export function AppLayout() {
       <footer className="border-t border-emerald-950/10 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 py-5 text-xs text-slate-500 sm:flex-row sm:px-6 lg:px-8">
           <p>
-            &copy; {new Date().getFullYear()} {apiConfig.appName}. Phase 1 Step 1
-            Customer Authentication Foundation.
+            &copy; {new Date().getFullYear()} {apiConfig.appName}. Phase 1 Step 2
+            Admin Account Management &amp; Customer Authentication.
           </p>
           <p>
-            API Base: <code className="font-mono text-slate-700">{apiConfig.apiBaseUrl}</code>{' '}
-            &middot; Mode: <span className="font-medium text-slate-700">{apiConfig.appEnv}</span>
+            API Base:{' '}
+            <code className="font-mono text-slate-700">
+              {apiConfig.apiBaseUrl}
+            </code>{' '}
+            &middot; Mode:{' '}
+            <span className="font-medium text-slate-700">
+              {apiConfig.appEnv}
+            </span>
           </p>
         </div>
       </footer>

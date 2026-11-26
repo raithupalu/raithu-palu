@@ -4,6 +4,7 @@ import {
   PublicUserProfile,
   toPublicUserProfile,
   UserRole,
+  StaffPermission,
 } from '../models/User';
 import {
   JwtAccessPayload,
@@ -25,7 +26,8 @@ export type AuthFailureStage =
   | 'USER_LOOKUP'
   | 'ACCOUNT_STATUS'
   | 'TOKEN_VERSION'
-  | 'ROLE_AUTHORIZATION';
+  | 'ROLE_AUTHORIZATION'
+  | 'STAFF_PERMISSION';
 
 export interface AuthRequestDiagnostics {
   authorizationHeaderPresent: boolean;
@@ -71,29 +73,25 @@ function sanitizeCandidateToken(raw: unknown): string | null {
 function extractBearerFromAuthorizationHeader(
   authHeader: unknown
 ): string | null {
-  if (typeof authHeader !== 'string') {
-    return null;
-  }
-  const trimmed = authHeader.trim();
-  if (!trimmed) {
-    return null;
-  }
+  if (typeof authHeader === 'string') {
+    const trimmed = authHeader.trim();
+    if (!trimmed) {
+      return null;
+    }
 
-  // Match case-insensitive "Bearer <token>" with any whitespace
-  const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
-  if (bearerMatch && bearerMatch[1]) {
-    return sanitizeCandidateToken(bearerMatch[1]);
-  }
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
+    if (bearerMatch && bearerMatch[1]) {
+      return sanitizeCandidateToken(bearerMatch[1]);
+    }
 
-  // Fallback: if header contains a raw 3-part JWT without "Bearer" prefix
-  const directCandidate = sanitizeCandidateToken(trimmed);
-  if (
-    directCandidate &&
-    /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(directCandidate)
-  ) {
-    return directCandidate;
+    const directCandidate = sanitizeCandidateToken(trimmed);
+    if (
+      directCandidate &&
+      /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(directCandidate)
+    ) {
+      return directCandidate;
+    }
   }
-
   return null;
 }
 
@@ -107,7 +105,6 @@ function extractCookieToken(req: Request): string | null {
     return fromCookieParser;
   }
 
-  // Fallback: parse raw Cookie header directly if cookie-parser did not populate req.cookies
   const rawCookieHeader = req.headers.cookie;
   if (typeof rawCookieHeader === 'string' && rawCookieHeader.length > 0) {
     const segments = rawCookieHeader.split(';');
@@ -191,7 +188,6 @@ function logAuthDiagnostics(
   diagnostics: AuthRequestDiagnostics
 ): void {
   req.authDiagnostics = diagnostics;
-  // Safe diagnostic logging: logs ONLY boolean flags, token source, failure stage, and error code; NEVER secrets/tokens/cookies
   if (diagnostics.failureStage !== 'NONE') {
     console.warn(
       '[AuthDiagnostics]',
@@ -356,6 +352,90 @@ export function requireRole(...allowedRoles: UserRole[]) {
         logAuthDiagnostics(req, {
           ...req.authDiagnostics,
           failureStage: 'ROLE_AUTHORIZATION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
+      return;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Enforces that a route can be accessed by an ADMIN or by a STAFF account
+ * holding the specified view-only permission on a read-only (GET/HEAD) request.
+ */
+export function requireStaffPermission(requiredPermission: StaffPermission) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    if (!req.authUser) {
+      const err = new AppError(
+        401,
+        'AUTHENTICATION_REQUIRED',
+        'Authentication is required to access this resource.'
+      );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'STAFF_PERMISSION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
+      return;
+    }
+
+    if (req.authUser.role === 'ADMIN') {
+      next();
+      return;
+    }
+
+    if (req.authUser.role !== 'STAFF') {
+      const err = new AppError(
+        403,
+        'FORBIDDEN_ROLE',
+        'Access denied. Required role: ADMIN or authorized STAFF.'
+      );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'ROLE_AUTHORIZATION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
+      return;
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const err = new AppError(
+        403,
+        'FORBIDDEN_STAFF_WRITE',
+        'Staff accounts have view-only access and cannot perform write operations.'
+      );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'STAFF_PERMISSION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
+      return;
+    }
+
+    const permissions = req.authUser.staffPermissions ?? [];
+    if (!permissions.includes(requiredPermission)) {
+      const err = new AppError(
+        403,
+        'FORBIDDEN_STAFF_PERMISSION',
+        `Access denied. Staff account does not hold the required permission: ${requiredPermission}.`
+      );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'STAFF_PERMISSION',
           errorCode: err.code,
         });
       }

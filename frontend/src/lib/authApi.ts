@@ -7,7 +7,19 @@ export type UserRole =
   | 'FARMER'
   | 'GRAZING_WORKER';
 
-export type UserStatus = 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
+export type ManagedUserRole = 'STAFF' | 'FARMER' | 'GRAZING_WORKER';
+
+export type UserStatus = 'ACTIVE' | 'INACTIVE' | 'SUSPENDED' | 'BLOCKED';
+
+export type StaffPermission =
+  | 'VIEW_CUSTOMERS'
+  | 'VIEW_DAILY_DELIVERIES'
+  | 'VIEW_BILLING'
+  | 'VIEW_PRODUCT_ORDERS'
+  | 'VIEW_FARMER_SUPPLY'
+  | 'VIEW_GRAZING_ATTENDANCE';
+
+export type MilkType = 'BUFFALO' | 'COW';
 
 export interface CustomerAddress {
   line1?: string;
@@ -18,17 +30,66 @@ export interface CustomerAddress {
   deliveryNotes?: string;
 }
 
+export interface FarmerProfile {
+  businessContactMobile: string;
+  villageOrLocation?: string;
+  suppliedMilkTypes: MilkType[];
+}
+
+export interface GrazingWorkerProfile {
+  emergencyContactMobile?: string;
+  assignedNotes?: string;
+}
+
 export interface CustomerProfile {
   id: string;
+  userCode?: string;
   fullName: string;
   mobileNumber: string;
   role: UserRole;
   status: UserStatus;
+  statusReason?: string;
   address?: CustomerAddress;
+  staffPermissions?: StaffPermission[];
+  farmerProfile?: FarmerProfile;
+  grazingWorkerProfile?: GrazingWorkerProfile;
+  createdBy?: string | null;
   lastLoginAt: string | null;
   lastLogoutAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type UserProfile = CustomerProfile;
+
+export interface AuditLogEntry {
+  id: string;
+  action: string;
+  actorId: string;
+  actorRole: string;
+  targetUserId: string;
+  targetUserCode: string;
+  targetRole: UserRole;
+  summary: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AccountSummaryMetrics {
+  totalManaged: number;
+  byRole: {
+    STAFF: number;
+    FARMER: number;
+    GRAZING_WORKER: number;
+    CUSTOMER: number;
+    ADMIN: number;
+  };
+  byStatus: {
+    ACTIVE: number;
+    INACTIVE: number;
+    SUSPENDED: number;
+    BLOCKED: number;
+  };
 }
 
 export interface AuthSuccessPayload {
@@ -56,6 +117,26 @@ export interface LoginCustomerPayload {
 export interface UpdateProfilePayload {
   fullName?: string;
   address?: CustomerAddress;
+}
+
+export interface CreateManagedAccountPayload {
+  role: ManagedUserRole;
+  fullName: string;
+  mobileNumber: string;
+  password: string;
+  status?: UserStatus;
+  staffPermissions?: StaffPermission[];
+  farmerProfile?: FarmerProfile;
+  grazingWorkerProfile?: GrazingWorkerProfile;
+}
+
+export interface UpdateManagedAccountPayload {
+  fullName?: string;
+  mobileNumber?: string;
+  password?: string;
+  staffPermissions?: StaffPermission[];
+  farmerProfile?: FarmerProfile;
+  grazingWorkerProfile?: GrazingWorkerProfile;
 }
 
 export class ApiRequestError extends Error {
@@ -191,6 +272,20 @@ export async function loginCustomerApi(
   return normalizeAuthSuccessPayload(raw);
 }
 
+export async function loginAdminApi(
+  input: LoginCustomerPayload
+): Promise<AuthSuccessPayload> {
+  const response = await fetch(buildApiUrl('/auth/admin/login'), {
+    method: 'POST',
+    headers: buildAuthHeaders(null, true),
+    credentials: 'include',
+    body: JSON.stringify(input),
+  });
+
+  const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
+  return normalizeAuthSuccessPayload(raw);
+}
+
 export async function logoutCustomerApi(
   accessToken: string | null
 ): Promise<void> {
@@ -201,6 +296,33 @@ export async function logoutCustomerApi(
   });
 
   await parseJsonOrThrow<Record<string, unknown>>(response);
+}
+
+export async function fetchSessionUserApi(
+  accessToken: string | null
+): Promise<CustomerProfile> {
+  const response = await fetch(buildApiUrl('/auth/me'), {
+    method: 'GET',
+    headers: buildAuthHeaders(accessToken, false),
+    credentials: 'include',
+  });
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    user?: CustomerProfile;
+    data?: { user?: CustomerProfile; profile?: CustomerProfile };
+  }>(response);
+
+  const user = result.data?.user ?? result.data?.profile ?? result.user;
+  if (!user) {
+    throw new ApiRequestError(
+      500,
+      'INVALID_SESSION_RESPONSE',
+      'User payload missing from session response.'
+    );
+  }
+
+  return user;
 }
 
 export async function fetchCustomerProfileApi(
@@ -258,4 +380,156 @@ export async function updateCustomerProfileApi(
   }
 
   return profile;
+}
+
+export async function fetchAdminAccountsApi(
+  accessToken: string | null,
+  filter: {
+    role?: string;
+    status?: string;
+    search?: string;
+  } = {}
+): Promise<{
+  accounts: UserProfile[];
+  metrics: AccountSummaryMetrics;
+  approvedStaffPermissions: StaffPermission[];
+}> {
+  const params = new URLSearchParams();
+  if (filter.role) params.set('role', filter.role);
+  if (filter.status) params.set('status', filter.status);
+  if (filter.search) params.set('search', filter.search);
+  const queryString = params.toString() ? `?${params.toString()}` : '';
+
+  const response = await fetch(buildApiUrl(`/admin/accounts${queryString}`), {
+    method: 'GET',
+    headers: buildAuthHeaders(accessToken, false),
+    credentials: 'include',
+  });
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    data: {
+      accounts: UserProfile[];
+      metrics: AccountSummaryMetrics;
+      approvedStaffPermissions: StaffPermission[];
+    };
+  }>(response);
+
+  return result.data;
+}
+
+export async function fetchAdminAccountDetailsApi(
+  accessToken: string | null,
+  accountId: string
+): Promise<{
+  account: UserProfile;
+  auditLogs: AuditLogEntry[];
+}> {
+  const response = await fetch(
+    buildApiUrl(`/admin/accounts/${encodeURIComponent(accountId)}`),
+    {
+      method: 'GET',
+      headers: buildAuthHeaders(accessToken, false),
+      credentials: 'include',
+    }
+  );
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    data: {
+      account: UserProfile;
+      auditLogs: AuditLogEntry[];
+    };
+  }>(response);
+
+  return result.data;
+}
+
+export async function createAdminManagedAccountApi(
+  accessToken: string | null,
+  payload: CreateManagedAccountPayload
+): Promise<UserProfile> {
+  const response = await fetch(buildApiUrl('/admin/accounts'), {
+    method: 'POST',
+    headers: buildAuthHeaders(accessToken, true),
+    credentials: 'include',
+    body: JSON.stringify(payload),
+  });
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    message: string;
+    data: { account: UserProfile };
+  }>(response);
+
+  return result.data.account;
+}
+
+export async function updateAdminManagedAccountApi(
+  accessToken: string | null,
+  accountId: string,
+  payload: UpdateManagedAccountPayload
+): Promise<UserProfile> {
+  const response = await fetch(
+    buildApiUrl(`/admin/accounts/${encodeURIComponent(accountId)}`),
+    {
+      method: 'PATCH',
+      headers: buildAuthHeaders(accessToken, true),
+      credentials: 'include',
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    message: string;
+    data: { account: UserProfile };
+  }>(response);
+
+  return result.data.account;
+}
+
+export async function updateAdminAccountStatusApi(
+  accessToken: string | null,
+  accountId: string,
+  payload: { status: UserStatus; reason?: string }
+): Promise<{ account: UserProfile; sessionRevoked: boolean }> {
+  const response = await fetch(
+    buildApiUrl(`/admin/accounts/${encodeURIComponent(accountId)}/status`),
+    {
+      method: 'PATCH',
+      headers: buildAuthHeaders(accessToken, true),
+      credentials: 'include',
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    message: string;
+    data: { account: UserProfile; sessionRevoked: boolean };
+  }>(response);
+
+  return result.data;
+}
+
+export async function fetchAdminAuditLogsApi(
+  accessToken: string | null,
+  limit = 25
+): Promise<AuditLogEntry[]> {
+  const response = await fetch(
+    buildApiUrl(`/admin/audit-logs?limit=${limit}`),
+    {
+      method: 'GET',
+      headers: buildAuthHeaders(accessToken, false),
+      credentials: 'include',
+    }
+  );
+
+  const result = await parseJsonOrThrow<{
+    status: string;
+    data: { auditLogs: AuditLogEntry[] };
+  }>(response);
+
+  return result.data.auditLogs;
 }

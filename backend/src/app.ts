@@ -8,6 +8,8 @@ import { env } from './config/env';
 import healthRouter from './routes/health.routes';
 import authRouter from './routes/auth.routes';
 import customerRouter from './routes/customer.routes';
+import adminRouter from './routes/admin.routes';
+import staffRouter from './routes/staff.routes';
 import { notFoundMiddleware, AppError } from './middleware/notFound';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
 
@@ -18,7 +20,6 @@ function buildCorsOptions(): CorsOptions {
 
   return {
     origin: (requestOrigin, callback) => {
-      // Allow non-browser requests (e.g. curl, health checks) with no Origin header
       if (!requestOrigin) {
         callback(null, true);
         return;
@@ -52,7 +53,6 @@ export function createApp(): Application {
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
 
-  // Security headers via Helmet (frameguard disabled for live preview compatibility)
   app.use(
     helmet({
       frameguard: false,
@@ -60,20 +60,19 @@ export function createApp(): Application {
     })
   );
 
-  // Environment-driven CORS configuration
   app.use(cors(buildCorsOptions()));
 
-  // Cookie parser registered before all route and authentication middleware
   app.use(cookieParser());
 
-  // Reasonable request-size limits
   app.use(express.json({ limit: env.JSON_BODY_LIMIT }));
   app.use(express.urlencoded({ extended: true, limit: env.JSON_BODY_LIMIT }));
 
-  // Phase 0 & Phase 1 Step 1 Routes
+  // Phase 0 & Phase 1 Routes
   app.use('/api/health', healthRouter);
   app.use('/api/auth', authRouter);
   app.use('/api/customer', customerRouter);
+  app.use('/api/admin', adminRouter);
+  app.use('/api/staff', staffRouter);
 
   // All unmatched /api/* routes return structured 404 JSON
   app.use('/api', notFoundMiddleware);

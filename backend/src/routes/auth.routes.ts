@@ -1,50 +1,24 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
 import { authController } from '../controllers/authController';
-import { requireAuth, requireRole } from '../middleware/authMiddleware';
-import { env } from '../config/env';
+import { requireAuth } from '../middleware/authMiddleware';
 
 const authRouter = Router();
 
-const authRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: env.NODE_ENV === 'production' ? 15 : 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    status: 'error',
-    code: 'RATE_LIMIT_EXCEEDED',
-    message:
-      'Too many authentication attempts from this IP. Please try again after 15 minutes.',
-  },
-});
+// Customer self-registration endpoints (Admin & managed roles cannot self-register)
+authRouter.post('/customer/register', authController.registerCustomer);
+authRouter.post('/register', authController.registerCustomer);
 
-// Public Customer Registration (strictly creates CUSTOMER role only)
-authRouter.post(
-  '/customer/register',
-  authRateLimiter,
-  authController.registerCustomer
-);
-authRouter.post('/register', authRateLimiter, authController.registerCustomer);
+// Customer-specific login endpoint
+authRouter.post('/customer/login', authController.loginCustomer);
 
-// Customer Login (mobileNumber + password)
-authRouter.post(
-  '/customer/login',
-  authRateLimiter,
-  authController.loginCustomer
-);
-authRouter.post('/login', authRateLimiter, authController.loginCustomer);
+// Admin-specific login endpoint (requires manual operator provisioning first)
+authRouter.post('/admin/login', authController.loginAdmin);
 
-// Authenticated Logout (invalidates token JTI + increments tokenVersion + clears cookie)
+// Unified role-aware login endpoint (authenticates active ADMIN, CUSTOMER, STAFF, FARMER, GRAZING_WORKER)
+authRouter.post('/login', authController.loginAnyRole);
+
+// Authenticated session & logout endpoints
 authRouter.post('/logout', requireAuth, authController.logout);
-authRouter.post('/customer/logout', requireAuth, authController.logout);
-
-// Current Authenticated Customer Session
-authRouter.get(
-  '/me',
-  requireAuth,
-  requireRole('CUSTOMER'),
-  authController.getCurrentSession
-);
+authRouter.get('/me', requireAuth, authController.getSession);
 
 export default authRouter;
