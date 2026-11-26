@@ -1,10 +1,13 @@
 import express, { Application, Request, Response, NextFunction } from 'express';
 import cors, { CorsOptions } from 'cors';
 import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
 import fs from 'fs';
 import path from 'path';
 import { env } from './config/env';
 import healthRouter from './routes/health.routes';
+import authRouter from './routes/auth.routes';
+import customerRouter from './routes/customer.routes';
 import { notFoundMiddleware, AppError } from './middleware/notFound';
 import { errorHandlerMiddleware } from './middleware/errorHandler';
 
@@ -59,12 +62,17 @@ export function createApp(): Application {
   // Environment-driven CORS configuration
   app.use(cors(buildCorsOptions()));
 
+  // Cookie parser for httpOnly authentication cookies
+  app.use(cookieParser());
+
   // Reasonable request-size limits
   app.use(express.json({ limit: env.JSON_BODY_LIMIT }));
   app.use(express.urlencoded({ extended: true, limit: env.JSON_BODY_LIMIT }));
 
-  // Phase 0 Foundation Routes
+  // Phase 0 & Phase 1 Step 1 Routes
   app.use('/api/health', healthRouter);
+  app.use('/api/auth', authRouter);
+  app.use('/api/customer', customerRouter);
 
   // All unmatched /api/* routes return structured 404 JSON
   app.use('/api', notFoundMiddleware);

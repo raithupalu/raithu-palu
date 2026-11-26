@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchSystemHealth, type HealthResponse } from '../lib/apiConfig';
+import { useAuth } from '../context/AuthContext';
 import { LoadingState } from '../components/LoadingState';
 import { ErrorState } from '../components/ErrorState';
 
@@ -12,10 +13,16 @@ interface PlannedModuleItem {
 
 const PLANNED_MODULES: readonly PlannedModuleItem[] = [
   {
-    title: 'Identity & Role Governance',
+    title: 'Customer Authentication Foundation',
     description:
-      'Role-based access foundation for Admin, Customer, Staff, Farmer/Milk Supplier, and Buffalo Grazing Worker accounts.',
-    phaseLabel: 'Deferred to Approved Phase',
+      'Customer registration, login, bcrypt password hashing, JWT session verification, logout revocation, and protected customer profile access.',
+    phaseLabel: 'Active in Phase 1 Step 1',
+  },
+  {
+    title: 'Admin, Staff, Farmer & Grazing Worker Governance',
+    description:
+      'Non-public account management and custom role permissions for Admin, Staff, Farmer/Milk Supplier, and Buffalo Grazing Worker roles.',
+    phaseLabel: 'Deferred to Next Step',
   },
   {
     title: 'Daily Buffalo Milk Delivery & Billing',
@@ -29,15 +36,10 @@ const PLANNED_MODULES: readonly PlannedModuleItem[] = [
       'Immutable customer payments, FIFO invoice allocations, advance credit provenance, and concurrency-guarded reversals.',
     phaseLabel: 'Deferred to Approved Phase',
   },
-  {
-    title: 'Farmer Procurement & Grazing Operations',
-    description:
-      'Milk supply quality logs, bi-monthly farmer settlements, and 4-stage camera-captured grazing attendance.',
-    phaseLabel: 'Deferred to Approved Phase',
-  },
 ];
 
 export function LandingDashboardPage() {
+  const { isAuthenticated, user } = useAuth();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,23 +70,45 @@ export function LandingDashboardPage() {
       <section className="overflow-hidden rounded-2xl border border-emerald-900/15 bg-gradient-to-br from-dairy-pasture to-dairy-pastureDark p-8 text-white shadow-sm sm:p-10">
         <div className="max-w-3xl space-y-4">
           <span className="inline-flex items-center rounded-full bg-white/15 px-3 py-1 text-xs font-semibold tracking-wide text-emerald-50">
-            PHASE 0 &bull; INFRASTRUCTURE &amp; MONOREPO FOUNDATION
+            PHASE 1 STEP 1 &bull; CUSTOMER AUTHENTICATION FOUNDATION
           </span>
           <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">
             Raithu Palu Dairy Management &amp; Customer Ordering Platform
           </h1>
           <p className="text-sm leading-relaxed text-emerald-50/90 sm:text-base">
-            Welcome to the Phase 0 foundation of Raithu Palu. The React + Vite +
-            Tailwind CSS frontend (`frontend/`) and Node.js + Express + Mongoose
-            backend (`backend/`) are configured and connected. Business workflows
-            remain locked until subsequent phases are approved.
+            Customers can now register and sign in with their 10-digit mobile
+            number and password, manage their protected customer profile, and
+            securely sign out.
           </p>
-          <div className="pt-2">
+          <div className="flex flex-wrap items-center gap-3 pt-2">
+            {isAuthenticated && user ? (
+              <Link
+                to="/customer/profile"
+                className="inline-flex items-center rounded-lg bg-white px-4 py-2.5 text-sm font-semibold text-dairy-pasture shadow-sm transition hover:bg-emerald-50"
+              >
+                Open Protected Customer Profile ({user.fullName}) &rarr;
+              </Link>
+            ) : (
+              <>
+                <Link
+                  to="/register"
+                  className="inline-flex items-center rounded-lg bg-white px-4 py-2.5 text-sm font-semibold text-dairy-pasture shadow-sm transition hover:bg-emerald-50"
+                >
+                  Register Customer Account &rarr;
+                </Link>
+                <Link
+                  to="/login"
+                  className="inline-flex items-center rounded-lg border border-white/40 bg-white/10 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-white/20"
+                >
+                  Customer Sign In
+                </Link>
+              </>
+            )}
             <Link
               to="/system-status"
-              className="inline-flex items-center rounded-lg bg-white px-4 py-2.5 text-sm font-semibold text-dairy-pasture shadow-sm transition hover:bg-emerald-50"
+              className="inline-flex items-center rounded-lg border border-white/30 px-4 py-2.5 text-sm font-medium text-emerald-50 transition hover:bg-white/10"
             >
-              Inspect Live System Health &rarr;
+              Inspect System Health
             </Link>
           </div>
         </div>
@@ -181,11 +205,11 @@ export function LandingDashboardPage() {
       <section aria-labelledby="roadmap-heading" className="space-y-4">
         <div>
           <h2 id="roadmap-heading" className="text-lg font-bold text-slate-900">
-            Architecture Scope Placeholders (Unimplemented in Phase 0)
+            Platform Phase Status
           </h2>
           <p className="text-xs text-slate-500">
-            The modules below are intentionally omitted in Phase 0 per strict scope
-            governance.
+            Customer authentication is active; remaining modules stay locked until
+            subsequent phases are approved.
           </p>
         </div>
 
@@ -200,7 +224,13 @@ export function LandingDashboardPage() {
                   <h3 className="text-base font-semibold text-slate-900">
                     {mod.title}
                   </h3>
-                  <span className="rounded-md bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600">
+                  <span
+                    className={`rounded-md px-2.5 py-0.5 text-xs font-medium ${
+                      mod.phaseLabel.startsWith('Active')
+                        ? 'bg-dairy-meadow text-dairy-pasture'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
                     {mod.phaseLabel}
                   </span>
                 </div>

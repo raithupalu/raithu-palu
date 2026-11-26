@@ -15,7 +15,7 @@ healthRouter.get('/', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
     service: 'raithu-palu-backend',
-    phase: 'phase-0-foundation',
+    phase: 'phase-1-step-1-customer-auth',
     timestamp: new Date().toISOString(),
     application: {
       status: 'up',

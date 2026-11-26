@@ -1,13 +1,22 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiConfig } from '../lib/apiConfig';
+import { useAuth } from '../context/AuthContext';
 
 export function AppLayout() {
+  const { user, isAuthenticated, logout } = useAuth();
+  const navigate = useNavigate();
+
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     `rounded-lg px-3.5 py-2 text-sm font-medium transition ${
       isActive
         ? 'bg-dairy-pasture text-white shadow-sm'
         : 'text-slate-700 hover:bg-dairy-meadow hover:text-dairy-pasture'
     }`;
+
+  async function handleHeaderLogout() {
+    await logout();
+    navigate('/login', { replace: true });
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-dairy-cream text-slate-800">
@@ -23,7 +32,7 @@ export function AppLayout() {
                   {apiConfig.appName}
                 </span>
                 <span className="rounded-full bg-dairy-meadow px-2.5 py-0.5 text-xs font-semibold text-dairy-pasture">
-                  Phase 0 Foundation
+                  Phase 1 &bull; Step 1
                 </span>
               </div>
               <p className="text-xs text-slate-500">
@@ -32,13 +41,40 @@ export function AppLayout() {
             </div>
           </div>
 
-          <nav aria-label="Main navigation" className="flex items-center gap-2">
+          <nav
+            aria-label="Main navigation"
+            className="flex flex-wrap items-center gap-2"
+          >
             <NavLink to="/" end className={navLinkClass}>
               Platform Overview
             </NavLink>
             <NavLink to="/system-status" className={navLinkClass}>
               System Health
             </NavLink>
+
+            {isAuthenticated && user ? (
+              <>
+                <NavLink to="/customer/profile" className={navLinkClass}>
+                  Customer Profile ({user.fullName.split(' ')[0]})
+                </NavLink>
+                <button
+                  type="button"
+                  onClick={() => void handleHeaderLogout()}
+                  className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-sm font-medium text-red-700 transition hover:bg-red-100"
+                >
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <>
+                <NavLink to="/login" className={navLinkClass}>
+                  Customer Sign In
+                </NavLink>
+                <NavLink to="/register" className={navLinkClass}>
+                  Register
+                </NavLink>
+              </>
+            )}
           </nav>
         </div>
       </header>
@@ -50,8 +86,8 @@ export function AppLayout() {
       <footer className="border-t border-emerald-950/10 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-4 py-5 text-xs text-slate-500 sm:flex-row sm:px-6 lg:px-8">
           <p>
-            &copy; {new Date().getFullYear()} {apiConfig.appName}. Phase 0 Project
-            Foundation.
+            &copy; {new Date().getFullYear()} {apiConfig.appName}. Phase 1 Step 1
+            Customer Authentication Foundation.
           </p>
           <p>
             API Base: <code className="font-mono text-slate-700">{apiConfig.apiBaseUrl}</code>{' '}
