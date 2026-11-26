@@ -1,6 +1,8 @@
-import express, { Application } from 'express';
+import express, { Application, Request, Response, NextFunction } from 'express';
 import cors, { CorsOptions } from 'cors';
 import helmet from 'helmet';
+import fs from 'fs';
+import path from 'path';
 import { env } from './config/env';
 import healthRouter from './routes/health.routes';
 import { notFoundMiddleware, AppError } from './middleware/notFound';
@@ -63,6 +65,24 @@ export function createApp(): Application {
 
   // Phase 0 Foundation Routes
   app.use('/api/health', healthRouter);
+
+  // All unmatched /api/* routes return structured 404 JSON
+  app.use('/api', notFoundMiddleware);
+
+  // Serve built frontend bundle on port 5000 when present for preview compatibility
+  const frontendDistPath = path.resolve(__dirname, '../../frontend/dist');
+  const frontendIndexHtml = path.join(frontendDistPath, 'index.html');
+
+  if (fs.existsSync(frontendIndexHtml)) {
+    app.use(express.static(frontendDistPath));
+    app.get('*', (req: Request, res: Response, next: NextFunction) => {
+      if (req.path.startsWith('/api')) {
+        next();
+        return;
+      }
+      res.sendFile(frontendIndexHtml);
+    });
+  }
 
   // 404 Not Found and Centralized Error Handling
   app.use(notFoundMiddleware);
