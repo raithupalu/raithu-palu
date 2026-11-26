@@ -2,9 +2,9 @@ import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { AppError } from '../middleware/notFound';
 import { PublicUserProfile, toPublicUserProfile, MilkServiceStatus, ProductOrderServiceStatus, WeeklyMilkSchedule, WeeklyScheduleStatus, DeliveryAddress } from '../models/User';
-import { userRepository } from '../repositories/userRepository';
-import { auditLogRepository } from '../repositories/auditLogRepository';
-import { customerNoteRepository } from '../repositories/customerNoteRepository';
+import { userRepository, inMemoryUserStore } from '../repositories/userRepository';
+import { auditLogRepository, inMemoryAuditLogStore } from '../repositories/auditLogRepository';
+import { customerNoteRepository, inMemoryNoteStore } from '../repositories/customerNoteRepository';
 import { UserModel } from '../models/User';
 import { AuditLogModel } from '../models/AuditLog';
 import { hashPassword } from './authService';
@@ -35,6 +35,41 @@ const ALLOWED_PRODUCT_TRANSITIONS: Record<string, string[]> = {
   'STOPPED': ['ACTIVE'],
 };
 
+// Transaction helper for atomic customer mutations + audit — supports multiple audits per operation
+// For Mongo: uses replica-set transaction (all repo calls + audits must use session)
+// For in-memory: snapshots all stores and restores on any failure (including audit failure)
+async function withAtomicMutation<T>(
+  operation: (session?: mongoose.ClientSession) => Promise<T>
+): Promise<T> {
+  const isMongo = mongoose.connection.readyState === 1;
+  if (isMongo) {
+    const session = await mongoose.startSession();
+    let result: T | undefined;
+    try {
+      await session.withTransaction(async () => {
+        result = await operation(session);
+      });
+      return result!;
+    } finally {
+      await session.endSession();
+    }
+  } else {
+    // In-memory atomicity via snapshot/restore — covers user, audit, notes
+    const userSnap = inMemoryUserStore.snapshot();
+    const auditSnap = inMemoryAuditLogStore.snapshot();
+    const noteSnap = inMemoryNoteStore.snapshot();
+    try {
+      return await operation(undefined);
+    } catch (e) {
+      // Restore all stores to pre-operation state
+      try { inMemoryUserStore.restore(userSnap); } catch {}
+      try { inMemoryAuditLogStore.restore(auditSnap); } catch {}
+      try { inMemoryNoteStore.restore(noteSnap); } catch {}
+      throw e;
+    }
+  }
+}
+
 interface ListParams {
   search?: unknown;
   status?: unknown;
@@ -52,6 +87,8 @@ export const customerManagementService = {
     const fullName = validateFullName(raw.fullName);
     const mobileNumber = normalizeAndValidateMobileNumber(raw.mobileNumber, 'Customer mobile number');
     const password = validatePasswordStrength(raw.password);
+    // Preserve raw password for retry safety — never mutate raw input
+    const rawPasswordForAudit = '***REDACTED***';
     let deliveryAddresses: DeliveryAddress[] | undefined;
     let activeDeliveryAddressId: string | null | undefined;
     if (raw.deliveryAddresses !== undefined) {
@@ -105,9 +142,7 @@ export const customerManagementService = {
     const tags = raw.tags !== undefined ? validateTagList(raw.tags) : [];
     let weeklyMilkSchedule: WeeklyMilkSchedule | null | undefined;
     if (raw.weeklyMilkSchedule !== undefined && raw.weeklyMilkSchedule !== null) {
-      // For creation, require full schedule? We'll allow partial but then fill defaults
       const parsed = validateWeeklyScheduleInput(raw.weeklyMilkSchedule);
-      // ensure all days present for creation; if missing, default 0
       const days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] as const;
       const schedule: WeeklyMilkSchedule = {
         scheduleId: crypto.randomUUID(),
@@ -125,32 +160,33 @@ export const customerManagementService = {
       weeklyMilkSchedule = schedule;
     }
 
-    const user = await userRepository.createCustomerAdmin({
-      fullName,
-      mobileNumber,
-      passwordHash,
-      deliveryAddresses,
-      activeDeliveryAddressId: activeDeliveryAddressId ?? null,
-      milkServiceStatus: 'PENDING_ACTIVATION',
-      productOrderServiceStatus: 'ACTIVE',
-      mustChangePassword: true,
-      tags,
-      weeklyMilkSchedule: weeklyMilkSchedule ?? null,
-      createdBy: actor.id,
+    // Unified atomic creation: Mongo transaction + in-memory snapshot via withAtomicMutation
+    return withAtomicMutation(async (session) => {
+      const user = await userRepository.createCustomerAdmin({
+        fullName,
+        mobileNumber,
+        passwordHash,
+        deliveryAddresses,
+        activeDeliveryAddressId: activeDeliveryAddressId ?? null,
+        milkServiceStatus: 'PENDING_ACTIVATION',
+        productOrderServiceStatus: 'ACTIVE',
+        mustChangePassword: true,
+        tags,
+        weeklyMilkSchedule: weeklyMilkSchedule ?? null,
+        createdBy: actor.id,
+      }, session);
+      await auditLogRepository.record({
+        action: 'CUSTOMER_CREATED_BY_ADMIN',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: user.id,
+        targetUserCode: user.userCode,
+        targetRole: 'CUSTOMER',
+        summary: `Admin ${actor.userCode} created customer ${user.userCode} (${user.fullName})`,
+        metadata: { mobileNumber: user.mobileNumber, mustChangePassword: true },
+      }, session);
+      return toPublicUserProfile(user);
     });
-
-    await auditLogRepository.record({
-      action: 'CUSTOMER_CREATED_BY_ADMIN',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: user.id,
-      targetUserCode: user.userCode,
-      targetRole: 'CUSTOMER',
-      summary: `Admin ${actor.userCode} created customer ${user.userCode} (${user.fullName})`,
-      metadata: { mobileNumber: user.mobileNumber, mustChangePassword: true },
-    });
-
-    return toPublicUserProfile(user);
   },
 
   async listCustomers(params: ListParams): Promise<{ customers: PublicUserProfile[]; total: number; page:number; pageSize:number }>{
@@ -188,71 +224,82 @@ export const customerManagementService = {
     if (raw.userCode !== undefined && raw.userCode !== existing.userCode) throw new AppError(400,'IMMUTABLE_ACCOUNT_FIELD','userCode immutable');
     if ('passwordHash' in raw || 'tokenVersion' in raw) throw new AppError(400,'IMMUTABLE_ACCOUNT_FIELD','Internal field immutable');
 
-    let updated: typeof existing | null = existing;
-    const changedFields: string[] = [];
-
-    if (raw.fullName !== undefined) {
-      const fn = validateFullName(raw.fullName);
-      updated = await updateCustomerFullName(customerId, fn);
-      changedFields.push('fullName');
-    }
-
+    // Pre-validate inputs outside transaction to fail fast
+    let newFullName: string | undefined;
+    if (raw.fullName !== undefined) newFullName = validateFullName(raw.fullName);
+    let newMobile: string | undefined;
     if (raw.mobileNumber !== undefined) {
-      const newMobile = normalizeAndValidateMobileNumber(raw.mobileNumber, 'Customer mobile number');
-      if (newMobile !== existing.mobileNumber) {
-        const prev = existing.mobileNumber;
-        updated = await userRepository.updateCustomerMobile(customerId, newMobile);
-        if (!updated) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
-        await auditLogRepository.record({
-          action: 'CUSTOMER_MOBILE_CHANGED',
-          actorId: actor.id,
-          actorRole: actor.role,
-          targetUserId: updated.id,
-          targetUserCode: updated.userCode,
-          targetRole: 'CUSTOMER',
-          summary: `Admin ${actor.userCode} changed mobile for ${updated.userCode} from ${prev} to ${newMobile}`,
-          metadata: { previousMobileNumber: prev, newMobileNumber: newMobile },
-        });
-        changedFields.push('mobileNumber');
-      }
+      newMobile = normalizeAndValidateMobileNumber(raw.mobileNumber, 'Customer mobile number');
     }
+    let newTags: string[] | undefined;
+    if (raw.tags !== undefined) newTags = validateTagList(raw.tags);
 
-    if (raw.tags !== undefined) {
-      const tags = validateTagList(raw.tags);
-      updated = await userRepository.updateTags(customerId, tags);
-      changedFields.push('tags');
-      await auditLogRepository.record({
-        action: 'CUSTOMER_TAG_UPDATED',
-        actorId: actor.id,
-        actorRole: actor.role,
-        targetUserId: updated!.id,
-        targetUserCode: updated!.userCode,
-        targetRole: 'CUSTOMER',
-        summary: `Admin ${actor.userCode} updated tags for ${updated!.userCode}`,
-        metadata: { tags },
-      });
-    }
-
-    if (changedFields.length===0 && raw.fullName===undefined && raw.mobileNumber===undefined && raw.tags===undefined) {
+    if (newFullName===undefined && newMobile===undefined && newTags===undefined) {
       throw new AppError(400,'VALIDATION_ERROR','At least one valid field must be provided');
     }
 
-    if (changedFields.length>0) {
-      await auditLogRepository.record({
-        action: 'CUSTOMER_UPDATED',
-        actorId: actor.id,
-        actorRole: actor.role,
-        targetUserId: updated!.id,
-        targetUserCode: updated!.userCode,
-        targetRole: 'CUSTOMER',
-        summary: `Admin ${actor.userCode} updated customer ${updated!.userCode} (${changedFields.join(',')})`,
-        metadata: { changedFields },
-      });
-    }
+    // Atomic mutation: all DB writes + audits in same transaction / snapshot
+    return withAtomicMutation(async (session) => {
+      let updated: typeof existing | null = existing;
+      const changedFields: string[] = [];
 
-    const final = await userRepository.findById(customerId);
-    if (!final) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
-    return toPublicUserProfile(final);
+      if (newFullName !== undefined) {
+        updated = await updateCustomerFullName(customerId, newFullName, session);
+        changedFields.push('fullName');
+      }
+
+      if (newMobile !== undefined) {
+        if (newMobile !== existing.mobileNumber) {
+          const prev = existing.mobileNumber;
+          updated = await userRepository.updateCustomerMobile(customerId, newMobile, session);
+          if (!updated) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
+          await auditLogRepository.record({
+            action: 'CUSTOMER_MOBILE_CHANGED',
+            actorId: actor.id,
+            actorRole: actor.role,
+            targetUserId: updated.id,
+            targetUserCode: updated.userCode,
+            targetRole: 'CUSTOMER',
+            summary: `Admin ${actor.userCode} changed mobile for ${updated.userCode} from ${prev} to ${newMobile}`,
+            metadata: { previousMobileNumber: prev, newMobileNumber: newMobile },
+          }, session);
+          changedFields.push('mobileNumber');
+        }
+      }
+
+      if (newTags !== undefined) {
+        updated = await userRepository.updateTags(customerId, newTags, session);
+        changedFields.push('tags');
+        await auditLogRepository.record({
+          action: 'CUSTOMER_TAG_UPDATED',
+          actorId: actor.id,
+          actorRole: actor.role,
+          targetUserId: updated!.id,
+          targetUserCode: updated!.userCode,
+          targetRole: 'CUSTOMER',
+          summary: `Admin ${actor.userCode} updated tags for ${updated!.userCode}`,
+          metadata: { tags: newTags },
+        }, session);
+      }
+
+      if (changedFields.length>0) {
+        await auditLogRepository.record({
+          action: 'CUSTOMER_UPDATED',
+          actorId: actor.id,
+          actorRole: actor.role,
+          targetUserId: updated!.id,
+          targetUserCode: updated!.userCode,
+          targetRole: 'CUSTOMER',
+          summary: `Admin ${actor.userCode} updated customer ${updated!.userCode} (${changedFields.join(',')})`,
+          metadata: { changedFields },
+        }, session);
+      }
+
+      // Return final state within same atomic context
+      const finalEntity = updated ? updated : await userRepository.findById(customerId) as unknown as typeof existing;
+      if (!finalEntity) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
+      return toPublicUserProfile(finalEntity);
+    });
   },
 
   async updateAccountStatus(actor: PublicUserProfile, customerId: string, raw: Record<string,unknown>): Promise<{ account: PublicUserProfile; sessionRevoked:boolean }>{
@@ -263,20 +310,22 @@ export const customerManagementService = {
     const requiresReason = newStatus==='SUSPENDED' || newStatus==='BLOCKED';
     const reason = validateStatusReason(raw.reason, requiresReason, 'Status reason');
     const prev = existing.status;
-    const updated = await userRepository.updateAccountStatus(customerId, newStatus, reason);
-    if (!updated) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
     const sessionRevoked = newStatus !== 'ACTIVE';
-    await auditLogRepository.record({
-      action: 'ACCOUNT_STATUS_CHANGED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated.id,
-      targetUserCode: updated.userCode,
-      targetRole: updated.role,
-      summary: `Admin ${actor.userCode} changed status of ${updated.userCode} from ${prev} to ${newStatus}${sessionRevoked ? ' revoked':''}`,
-      metadata: { previousStatus: prev, newStatus, reason: reason ?? null, sessionRevoked },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.updateAccountStatus(customerId, newStatus, reason, session);
+      if (!updated) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
+      await auditLogRepository.record({
+        action: 'ACCOUNT_STATUS_CHANGED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated.id,
+        targetUserCode: updated.userCode,
+        targetRole: updated.role,
+        summary: `Admin ${actor.userCode} changed status of ${updated.userCode} from ${prev} to ${newStatus}${sessionRevoked ? ' revoked':''}`,
+        metadata: { previousStatus: prev, newStatus, reason: reason ?? null, sessionRevoked },
+      }, session);
+      return { account: toPublicUserProfile(updated), sessionRevoked };
     });
-    return { account: toPublicUserProfile(updated), sessionRevoked };
   },
 
   async updateMilkServiceStatus(actor: PublicUserProfile, customerId: string, raw: Record<string,unknown>): Promise<PublicUserProfile>{
@@ -284,28 +333,28 @@ export const customerManagementService = {
     if (!existing) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
     const newStatus = validateMilkServiceStatus(raw.status);
     const current = (existing.milkServiceStatus ?? 'ACTIVE') as MilkServiceStatus;
-    // Transition validation
     const allowed = ALLOWED_MILK_TRANSITIONS[current];
     if (!allowed || !allowed.includes(newStatus)) {
-      // Allow same status? No, treat as no-op but still require reason logic? We'll allow same to be idempotent
       if (current !== newStatus) {
         throw new AppError(400,'INVALID_STATUS_TRANSITION',`Cannot transition milk service from ${current} to ${newStatus}`);
       }
     }
     const requiresReason = newStatus==='PAUSED' || newStatus==='STOPPED';
     const reason = validateStatusReason(raw.reason, requiresReason, 'Service status reason');
-    const updated = await userRepository.updateMilkServiceStatus(customerId, newStatus);
-    await auditLogRepository.record({
-      action: 'MILK_SERVICE_STATUS_CHANGED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} changed milk service of ${updated!.userCode} from ${current} to ${newStatus}`,
-      metadata: { previousStatus: current, newStatus, reason: reason ?? null },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.updateMilkServiceStatus(customerId, newStatus, session);
+      await auditLogRepository.record({
+        action: 'MILK_SERVICE_STATUS_CHANGED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} changed milk service of ${updated!.userCode} from ${current} to ${newStatus}`,
+        metadata: { previousStatus: current, newStatus, reason: reason ?? null },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async updateProductOrderServiceStatus(actor: PublicUserProfile, customerId: string, raw: Record<string,unknown>): Promise<PublicUserProfile>{
@@ -319,18 +368,20 @@ export const customerManagementService = {
     }
     const requiresReason = newStatus==='PAUSED' || newStatus==='STOPPED';
     const reason = validateStatusReason(raw.reason, requiresReason, 'Service status reason');
-    const updated = await userRepository.updateProductOrderServiceStatus(customerId, newStatus);
-    await auditLogRepository.record({
-      action: 'PRODUCT_SERVICE_STATUS_CHANGED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} changed product service of ${updated!.userCode} from ${current} to ${newStatus}`,
-      metadata: { previousStatus: current, newStatus, reason: reason ?? null },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.updateProductOrderServiceStatus(customerId, newStatus, session);
+      await auditLogRepository.record({
+        action: 'PRODUCT_SERVICE_STATUS_CHANGED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} changed product service of ${updated!.userCode} from ${current} to ${newStatus}`,
+        metadata: { previousStatus: current, newStatus, reason: reason ?? null },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async updateWeeklySchedule(actor: PublicUserProfile, customerId: string, raw: Record<string,unknown>): Promise<PublicUserProfile>{
@@ -371,7 +422,6 @@ export const customerManagementService = {
       sunday: (input as unknown as Record<string, {quantityLitres:number}>).sunday ?? existingSchedule?.sunday ?? { quantityLitres:0 },
     };
 
-    const updated = await userRepository.setWeeklySchedule(customerId, schedule);
     let action: string = 'WEEKLY_SCHEDULE_UPDATED';
     if (currentStatus !== newStatus) {
       if (newStatus==='ACTIVE' && currentStatus==='PAUSED') action='WEEKLY_SCHEDULE_RESUMED';
@@ -379,17 +429,20 @@ export const customerManagementService = {
       else if (newStatus==='INACTIVE') action='WEEKLY_SCHEDULE_DEACTIVATED';
       else if (newStatus==='PAUSED') action='WEEKLY_SCHEDULE_PAUSED';
     }
-    await auditLogRepository.record({
-      action: action as unknown as 'WEEKLY_SCHEDULE_UPDATED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} updated weekly schedule for ${updated!.userCode} to ${newStatus}`,
-      metadata: { previousStatus: currentStatus, newStatus, schedule },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.setWeeklySchedule(customerId, schedule, session);
+      await auditLogRepository.record({
+        action: action as unknown as 'WEEKLY_SCHEDULE_UPDATED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} updated weekly schedule for ${updated!.userCode} to ${newStatus}`,
+        metadata: { previousStatus: currentStatus, newStatus, schedule },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async createNote(actor: PublicUserProfile, customerId: string, body: unknown): Promise<import('../models/CustomerNote').CustomerNoteEntity> {
@@ -397,18 +450,20 @@ export const customerManagementService = {
     if (!existing) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
     if (typeof body !== 'string' || body.trim().length===0) throw new AppError(400,'VALIDATION_ERROR','Note body is required');
     if (body.trim().length>2000) throw new AppError(400,'VALIDATION_ERROR','Note cannot exceed 2000 chars');
-    const note = await customerNoteRepository.create(customerId, actor.id, actor.userCode, body.trim());
-    await auditLogRepository.record({
-      action: 'CUSTOMER_NOTE_CREATED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: existing.id,
-      targetUserCode: existing.userCode,
-      targetRole: 'CUSTOMER',
-      summary: `Admin ${actor.userCode} added note for ${existing.userCode}`,
-      metadata: { noteId: note.id },
+    return withAtomicMutation(async (session) => {
+      const note = await customerNoteRepository.create(customerId, actor.id, actor.userCode, body.trim(), session);
+      await auditLogRepository.record({
+        action: 'CUSTOMER_NOTE_CREATED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: existing.id,
+        targetUserCode: existing.userCode,
+        targetRole: 'CUSTOMER',
+        summary: `Admin ${actor.userCode} added note for ${existing.userCode}`,
+        metadata: { noteId: note.id },
+      }, session);
+      return note;
     });
-    return note;
   },
 
   async listNotes(customerId: string, page: unknown, limit: unknown): Promise<{ notes: import('../models/CustomerNote').CustomerNoteEntity[]; total:number; page:number; pageSize:number }>{
@@ -427,15 +482,70 @@ export const customerManagementService = {
     let p = Number(page) || 1;
     let l = Number(limit) || 20;
     if (p<1) p=1; if (l<1||l>100) l=20;
-    // Fetch complete histories without arbitrary 200 limit — use large limit to retrieve all
-    const audits = await auditLogRepository.list({ targetUserId: customerId, limit: 10000 });
-    const { notes } = await customerNoteRepository.list(customerId, 1, 10000);
-    const auditEntries = audits.map(a=> ({ type:'AUDIT', id:a.id, action:a.action, summary:a.summary, metadata:a.metadata, actorId:a.actorId, actorRole:a.actorRole, createdAt:a.createdAt }));
-    const noteEntries = notes.map(n=> ({ type:'NOTE', id:n.id, body:n.body, authorCode:n.authorCode, createdAt:n.createdAt }));
-    const merged = [...auditEntries, ...noteEntries].sort((a,b)=> new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime());
-    const total = merged.length;
-    const start=(p-1)*l;
-    return { entries: merged.slice(start, start+l), total, page:p, pageSize:l };
+
+    // Correct DB-level pagination: totals via countDocuments, entries via merged pagination
+    // Uses database-level pagination (skip/limit) for each collection and merges to support >10k entries
+    const isMongo = mongoose.connection.readyState === 1;
+    if (isMongo) {
+      // Get totals via counts (DB-level)
+      const [auditTotal, noteTotal] = await Promise.all([
+        auditLogRepository.count({ targetUserId: customerId }),
+        (async () => {
+          const { total } = await customerNoteRepository.list(customerId, 1, 1);
+          // Use count via model directly for accuracy when large
+          try {
+            const { CustomerNoteModel } = await import('../models/CustomerNote');
+            return await CustomerNoteModel.countDocuments({ customerId: new mongoose.Types.ObjectId(customerId) }).exec();
+          } catch { return total; }
+        })(),
+      ]);
+      const total = auditTotal + noteTotal;
+
+      // For merged pagination, fetch top (p*l) from each collection via DB limit, then slice
+      // This is DB-level pagination (limit) with correct global ordering and supports >10k
+      const needed = p * l;
+      const [audits, noteRes] = await Promise.all([
+        AuditLogModel.find({ targetUserId: customerId }).sort({ createdAt: -1, _id: -1 }).limit(needed).lean().exec(),
+        (async () => {
+          const { CustomerNoteModel } = await import('../models/CustomerNote');
+          return CustomerNoteModel.find({ customerId: new mongoose.Types.ObjectId(customerId) })
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(needed)
+            .lean()
+            .exec();
+        })(),
+      ]);
+      const auditEntries = audits.map((a: unknown) => {
+        const doc = a as { _id: { toString(): string }; action: string; summary: string; metadata: unknown; actorId: string; actorRole: string; createdAt: Date };
+        return { type: 'AUDIT', id: doc._id.toString(), action: doc.action, summary: doc.summary, metadata: doc.metadata, actorId: doc.actorId, actorRole: doc.actorRole, createdAt: doc.createdAt };
+      });
+      const noteEntries = noteRes.map((n: unknown) => {
+        const doc = n as { _id: { toString(): string }; body: string; authorCode: string; createdAt: Date };
+        return { type: 'NOTE', id: doc._id.toString(), body: doc.body, authorCode: doc.authorCode, createdAt: doc.createdAt };
+      });
+      const merged = [...auditEntries, ...noteEntries].sort((a,b)=> {
+        const timeDiff = new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime();
+        if (timeDiff !== 0) return timeDiff;
+        // Deterministic secondary sort by _id descending for identical timestamps
+        return String(b.id).localeCompare(String(a.id));
+      });
+      const start = (p - 1) * l;
+      return { entries: merged.slice(start, start + l), total, page: p, pageSize: l };
+    } else {
+      // In-memory: fetch all without artificial cap, then paginate in memory (no 10k limit)
+      const audits = await auditLogRepository.getAllForTimeline({ targetUserId: customerId });
+      const auditEntries = audits.map((a)=> ({ type:'AUDIT', id:a.id, action:a.action, summary:a.summary, metadata:a.metadata, actorId:a.actorId, actorRole:a.actorRole, createdAt:a.createdAt }));
+      const allNotes = inMemoryNoteStore.list(customerId, Number.MAX_SAFE_INTEGER, 1);
+      const noteEntries: Array<Record<string,unknown>> = allNotes.notes.map((n: { id: string; body: string; authorCode: string; createdAt: Date })=> ({ type:'NOTE', id:n.id, body:n.body, authorCode:n.authorCode, createdAt:n.createdAt }));
+      const merged = [...auditEntries, ...noteEntries].sort((a,b)=> {
+        const timeDiff = new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime();
+        if (timeDiff !== 0) return timeDiff;
+        return String(b.id).localeCompare(String(a.id));
+      });
+      const total = merged.length;
+      const start=(p-1)*l;
+      return { entries: merged.slice(start, start+l), total, page:p, pageSize:l };
+    }
   },
 
   async addAddress(actor: PublicUserProfile, customerId: string, raw: unknown): Promise<PublicUserProfile>{
@@ -455,64 +565,72 @@ export const customerManagementService = {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    const updated = await userRepository.addDeliveryAddress(customerId, addr);
-    await auditLogRepository.record({
-      action: 'ADDRESS_CREATED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} added address for ${updated!.userCode}`,
-      metadata: { addressId: addr.addressId },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.addDeliveryAddress(customerId, addr, session);
+      await auditLogRepository.record({
+        action: 'ADDRESS_CREATED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} added address for ${updated!.userCode}`,
+        metadata: { addressId: addr.addressId },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async updateAddress(actor: PublicUserProfile, customerId: string, addressId: string, raw: unknown): Promise<PublicUserProfile>{
     const updates = validateDeliveryAddressInput(raw);
-    const updated = await userRepository.updateDeliveryAddress(customerId, addressId, updates);
-    await auditLogRepository.record({
-      action: 'ADDRESS_UPDATED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} updated address ${addressId} for ${updated!.userCode}`,
-      metadata: { addressId },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.updateDeliveryAddress(customerId, addressId, updates, session);
+      await auditLogRepository.record({
+        action: 'ADDRESS_UPDATED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} updated address ${addressId} for ${updated!.userCode}`,
+        metadata: { addressId },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async activateAddress(actor: PublicUserProfile, customerId: string, addressId: string): Promise<PublicUserProfile>{
-    const updated = await userRepository.setActiveDeliveryAddress(customerId, addressId);
-    await auditLogRepository.record({
-      action: 'ACTIVE_ADDRESS_CHANGED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} set active address ${addressId} for ${updated!.userCode}`,
-      metadata: { addressId },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.setActiveDeliveryAddress(customerId, addressId, session);
+      await auditLogRepository.record({
+        action: 'ACTIVE_ADDRESS_CHANGED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} set active address ${addressId} for ${updated!.userCode}`,
+        metadata: { addressId },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async archiveAddress(actor: PublicUserProfile, customerId: string, addressId: string): Promise<PublicUserProfile>{
-    const updated = await userRepository.archiveDeliveryAddress(customerId, addressId);
-    await auditLogRepository.record({
-      action: 'ADDRESS_ARCHIVED',
-      actorId: actor.id,
-      actorRole: actor.role,
-      targetUserId: updated!.id,
-      targetUserCode: updated!.userCode,
-      targetRole: updated!.role,
-      summary: `Admin ${actor.userCode} archived address ${addressId} for ${updated!.userCode}`,
-      metadata: { addressId },
+    return withAtomicMutation(async (session) => {
+      const updated = await userRepository.archiveDeliveryAddress(customerId, addressId, session);
+      await auditLogRepository.record({
+        action: 'ADDRESS_ARCHIVED',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: updated!.id,
+        targetUserCode: updated!.userCode,
+        targetRole: updated!.role,
+        summary: `Admin ${actor.userCode} archived address ${addressId} for ${updated!.userCode}`,
+        metadata: { addressId },
+      }, session);
+      return toPublicUserProfile(updated!);
     });
-    return toPublicUserProfile(updated!);
   },
 
   async bulkImport(actor: PublicUserProfile, buffer: Buffer, filename: string, dryRun = false): Promise<{ imported: number; customers: PublicUserProfile[]; dryRun?: boolean; preview?: Array<Record<string,unknown>> }> {
@@ -610,164 +728,175 @@ export const customerManagementService = {
     const created: PublicUserProfile[] = [];
     try {
     if (useTransaction) {
-      // Precompute base sequence atomically before transaction to support concurrent imports
-      const existingDocs = await UserModel.find({ role:'CUSTOMER', userCode: new RegExp(`^CUS-\\d+$`) }).select('userCode').lean().exec();
-      let baseMax = 0;
-      for (const d of existingDocs) {
-        const seq = Number.parseInt(d.userCode.slice(4),10);
-        if (!Number.isNaN(seq) && seq > baseMax) baseMax = seq;
-      }
-      let nextSeq = baseMax + 1;
-      const session = await mongoose.startSession();
-      try {
-        await session.withTransaction(async ()=>{
-          for (const nr of normalizedRows) {
-            const passwordHash = await hashPassword(nr.password);
-            // Zero out password after hash
-            (nr as unknown as Record<string,unknown>).password = undefined;
-            let deliveryAddresses: DeliveryAddress[]|undefined;
-            let activeId: string|null|undefined;
-            if (nr.pincode && nr.line1) {
-              const addr: DeliveryAddress = {
-                addressId: crypto.randomUUID(),
-                label: (nr.label?.toUpperCase() as DeliveryAddress['label']) ?? 'HOME',
-                line1: nr.line1!,
-                city: nr.city,
-                pincode: nr.pincode!,
-                isArchived: false,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              };
-              deliveryAddresses = [addr];
-              activeId = addr.addressId;
-            }
-            // Allocate unique code sequentially within batch, with retry on collision for concurrent imports
-            let doc: typeof UserModel.prototype & { _id: { toString(): string }; userCode: string } | null = null;
-            let attempts = 0;
-            while (!doc && attempts < 5) {
+      let outerAttempts = 0;
+      let lastError: unknown = null;
+      while (outerAttempts < 5) {
+        outerAttempts += 1;
+        // Recompute baseMax for every complete transaction attempt — ensures retry sees latest committed codes
+        const existingDocs = await UserModel.find({ role:'CUSTOMER', userCode: new RegExp(`^CUS-\\d+$`) }).select('userCode').lean().exec();
+        let baseMax = 0;
+        for (const d of existingDocs) {
+          const seq = Number.parseInt(d.userCode.slice(4),10);
+          if (!Number.isNaN(seq) && seq > baseMax) baseMax = seq;
+        }
+        const session = await mongoose.startSession();
+        const attemptCreated: PublicUserProfile[] = [];
+        try {
+          await session.withTransaction(async ()=>{
+            // Driver may retry this callback on TransientTransactionError — every invocation must start fresh.
+            // nextSeq is scoped INSIDE the callback so retries begin at baseMax+1, not a partially-incremented value.
+            let nextSeq = baseMax + 1;
+            attemptCreated.length = 0;
+            for (const nr of normalizedRows) {
+              // Preserve raw password across driver-level retries — do not mutate nr.password
+              const rawPassword = nr.password;
+              const passwordHash = await hashPassword(rawPassword);
+              let deliveryAddresses: DeliveryAddress[]|undefined;
+              let activeId: string|null|undefined;
+              if (nr.pincode && nr.line1) {
+                const addr: DeliveryAddress = {
+                  addressId: crypto.randomUUID(),
+                  label: (nr.label?.toUpperCase() as DeliveryAddress['label']) ?? 'HOME',
+                  line1: nr.line1!,
+                  city: nr.city,
+                  pincode: nr.pincode!,
+                  isArchived: false,
+                  createdAt: new Date(),
+                  updatedAt: new Date(),
+                };
+                deliveryAddresses = [addr];
+                activeId = addr.addressId;
+              }
+              // No inner duplicate retry — duplicate aborts transaction and is retried as whole via outerAttempts
               const code = `CUS-${String(nextSeq).padStart(4,'0')}`;
               nextSeq += 1;
-              attempts += 1;
-              try {
-                const createdDocs = await UserModel.create([{
-                  userCode: code,
-                  fullName: nr.fullName,
-                  mobileNumber: nr.mobileNumber,
-                  passwordHash,
-                  role:'CUSTOMER',
-                  status:'ACTIVE',
-                  deliveryAddresses: deliveryAddresses ?? [],
-                  activeDeliveryAddressId: activeId ?? null,
-                  milkServiceStatus:'PENDING_ACTIVATION',
-                  productOrderServiceStatus:'ACTIVE',
-                  mustChangePassword:true,
-                  tags:[],
-                  createdBy: actor.id,
-                  tokenVersion:0,
-                }], { session });
-                doc = createdDocs[0] as unknown as typeof doc;
-              } catch (err: unknown) {
-                const isDup = (err as { code?: number; keyPattern?: Record<string,unknown> })?.code === 11000;
-                const isUserCodeDup = isDup && ((err as { keyPattern?: Record<string,unknown> })?.keyPattern && 'userCode' in ((err as { keyPattern?: Record<string,unknown> })?.keyPattern ?? {}));
-                if (isDup && isUserCodeDup && attempts < 5) {
-                  continue; // retry with next code
-                }
-                // Handle potential string message duplicate
-                const msg = (err as { message?: string })?.message ?? '';
-                if (msg.includes('user_code_unique') && attempts < 5) continue;
-                throw err;
-              }
+              const createdDocs = await UserModel.create([{
+                userCode: code,
+                fullName: nr.fullName,
+                mobileNumber: nr.mobileNumber,
+                passwordHash,
+                role:'CUSTOMER',
+                status:'ACTIVE',
+                deliveryAddresses: deliveryAddresses ?? [],
+                activeDeliveryAddressId: activeId ?? null,
+                milkServiceStatus:'PENDING_ACTIVATION',
+                productOrderServiceStatus:'ACTIVE',
+                mustChangePassword:true,
+                tags:[],
+                createdBy: actor.id,
+                tokenVersion:0,
+              }], { session });
+              const doc = createdDocs[0] as unknown as { _id: { toString(): string }; userCode: string; fullName: string; mobileNumber: string; passwordHash: string; role: string; status: string; address: unknown; deliveryAddresses: unknown; activeDeliveryAddressId: string | null; milkServiceStatus: unknown; productOrderServiceStatus: unknown; weeklyMilkSchedule: unknown; tags: unknown; mustChangePassword: boolean; createdBy: string | null; tokenVersion: number; lastLoginAt: Date | null; lastLogoutAt: Date | null; createdAt: Date; updatedAt: Date };
+              const entity = doc as unknown as { _id: { toString(): string }; userCode: string; fullName: string; mobileNumber: string; passwordHash: string; role: string; status: string; address: unknown; deliveryAddresses: unknown; activeDeliveryAddressId: string | null; milkServiceStatus: unknown; productOrderServiceStatus: unknown; weeklyMilkSchedule: unknown; tags: unknown; mustChangePassword: boolean; createdBy: string | null; tokenVersion: number; lastLoginAt: Date | null; lastLogoutAt: Date | null; createdAt: Date; updatedAt: Date };
+              await AuditLogModel.create([{
+                action:'CUSTOMER_BULK_IMPORTED',
+                actorId: actor.id,
+                actorRole: actor.role,
+                targetUserId: entity._id.toString(),
+                targetUserCode: entity.userCode,
+                targetRole:'CUSTOMER',
+                summary:`Bulk imported customer ${entity.userCode} via ${filename}`,
+                metadata:{ mobileNumber: entity.mobileNumber, row: nr.row },
+              }], { session });
+              attemptCreated.push(toPublicUserProfile({
+                id: entity._id.toString(),
+                userCode: entity.userCode,
+                fullName: entity.fullName,
+                mobileNumber: entity.mobileNumber,
+                passwordHash: entity.passwordHash,
+                role: entity.role as unknown as 'CUSTOMER',
+                status: entity.status,
+                address: entity.address,
+                deliveryAddresses: entity.deliveryAddresses as unknown as DeliveryAddress[],
+                activeDeliveryAddressId: entity.activeDeliveryAddressId,
+                milkServiceStatus: entity.milkServiceStatus,
+                productOrderServiceStatus: entity.productOrderServiceStatus,
+                weeklyMilkSchedule: entity.weeklyMilkSchedule,
+                tags: entity.tags,
+                mustChangePassword: entity.mustChangePassword,
+                createdBy: entity.createdBy,
+                tokenVersion: entity.tokenVersion,
+                lastLoginAt: entity.lastLoginAt,
+                lastLogoutAt: entity.lastLogoutAt,
+                createdAt: entity.createdAt,
+                updatedAt: entity.updatedAt,
+              } as unknown as import('../models/User').UserEntity));
             }
-            if (!doc) throw new AppError(409,'USER_CODE_CONFLICT','Failed to allocate unique user code after retries');
-            const entity = doc as unknown as { _id: { toString(): string }; userCode: string; fullName: string; mobileNumber: string; passwordHash: string; role: string; status: string; address: unknown; deliveryAddresses: unknown; activeDeliveryAddressId: string | null; milkServiceStatus: unknown; productOrderServiceStatus: unknown; weeklyMilkSchedule: unknown; tags: unknown; mustChangePassword: boolean; createdBy: string | null; tokenVersion: number; lastLoginAt: Date | null; lastLogoutAt: Date | null; createdAt: Date; updatedAt: Date };
-            await AuditLogModel.create([{
-              action:'CUSTOMER_BULK_IMPORTED',
-              actorId: actor.id,
-              actorRole: actor.role,
-              targetUserId: entity._id.toString(),
-              targetUserCode: entity.userCode,
-              targetRole:'CUSTOMER',
-              summary:`Bulk imported customer ${entity.userCode} via ${filename}`,
-              metadata:{ mobileNumber: entity.mobileNumber, row: nr.row },
-            }], { session });
-            created.push(toPublicUserProfile({
-              id: entity._id.toString(),
-              userCode: entity.userCode,
-              fullName: entity.fullName,
-              mobileNumber: entity.mobileNumber,
-              passwordHash: entity.passwordHash,
-              role: entity.role as unknown as 'CUSTOMER',
-              status: entity.status,
-              address: entity.address,
-              deliveryAddresses: entity.deliveryAddresses as unknown as DeliveryAddress[],
-              activeDeliveryAddressId: entity.activeDeliveryAddressId,
-              milkServiceStatus: entity.milkServiceStatus,
-              productOrderServiceStatus: entity.productOrderServiceStatus,
-              weeklyMilkSchedule: entity.weeklyMilkSchedule,
-              tags: entity.tags,
-              mustChangePassword: entity.mustChangePassword,
-              createdBy: entity.createdBy,
-              tokenVersion: entity.tokenVersion,
-              lastLoginAt: entity.lastLoginAt,
-              lastLogoutAt: entity.lastLogoutAt,
-              createdAt: entity.createdAt,
-              updatedAt: entity.updatedAt,
-            } as unknown as import('../models/User').UserEntity));
+          });
+          // Success — commit
+          created.push(...attemptCreated);
+          await session.endSession();
+          break;
+        } catch (err: unknown) {
+          await session.endSession();
+          const msg = (err as { message?: string; code?: number })?.message ?? '';
+          const code = (err as { code?: number })?.code;
+          const isDup = code === 11000 || msg.includes('user_code_unique') || msg.includes('E11000');
+          const isUserCodeDup = isDup && (msg.includes('userCode') || msg.includes('user_code_unique') || (err as { keyPattern?: Record<string,unknown> })?.keyPattern && 'userCode' in ((err as { keyPattern?: Record<string,unknown> })?.keyPattern ?? {}));
+          // Only retry eligible duplicate user_code_unique conflicts — not unrelated errors
+          if ((isDup && (isUserCodeDup || msg.includes('user_code_unique'))) && outerAttempts < 5) {
+            lastError = err;
+            continue; // retry entire transaction with recomputed baseMax
           }
-        });
-      } catch (e) {
-        throw e;
-      } finally {
-        await session.endSession();
-        // Clear password remnants
-        for (const nr of normalizedRows) (nr as unknown as Record<string,unknown>).password = undefined;
-        // Zero buffer
-        buffer.fill(0);
-      }
-    } else {
-      // Non-transactional fallback for in-memory (but simulate atomicity by pre-validating)
-      for (const nr of normalizedRows) {
-        const passwordHash = await hashPassword(nr.password);
-        (nr as unknown as Record<string,unknown>).password = undefined;
-        let deliveryAddresses: DeliveryAddress[]|undefined;
-        let activeId: string|null|undefined;
-        if (nr.pincode && nr.line1) {
-          const addr: DeliveryAddress = {
-            addressId: crypto.randomUUID(),
-            label: (nr.label?.toUpperCase() as DeliveryAddress['label']) ?? 'HOME',
-            line1: nr.line1!,
-            city: nr.city,
-            pincode: nr.pincode!,
-            isArchived: false,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          };
-          deliveryAddresses = [addr];
-          activeId = addr.addressId;
+          // Transient transaction errors should also be retried by driver, but we handle duplicate only
+          throw err;
         }
-        const user = await userRepository.createCustomerAdmin({
-          fullName: nr.fullName,
-          mobileNumber: nr.mobileNumber,
-          passwordHash,
-          deliveryAddresses,
-          activeDeliveryAddressId: activeId ?? null,
-          milkServiceStatus:'PENDING_ACTIVATION',
-          productOrderServiceStatus:'ACTIVE',
-          mustChangePassword:true,
-          createdBy: actor.id,
-        });
-        await auditLogRepository.record({
-          action:'CUSTOMER_BULK_IMPORTED',
-          actorId: actor.id,
-          actorRole: actor.role,
-          targetUserId: user.id,
-          targetUserCode: user.userCode,
-          targetRole:'CUSTOMER',
-          summary:`Bulk imported customer ${user.userCode}`,
-          metadata:{ mobileNumber: user.mobileNumber, row: nr.row },
-        });
-        created.push(toPublicUserProfile(user));
       }
+      if (created.length === 0 && outerAttempts >= 5) {
+        throw new AppError(409,'USER_CODE_CONFLICT','Failed to allocate unique user code after 5 transaction retries');
+      }
+      // Clear sensitive data after transaction attempts
+      for (const nr of normalizedRows) (nr as unknown as Record<string,unknown>).password = undefined;
+      buffer.fill(0);
+    } else {
+      // In-memory atomic fallback: all rows + audits in single snapshot transaction
+      const inMemCreated = await withAtomicMutation(async () => {
+        const local: PublicUserProfile[] = [];
+        for (const nr of normalizedRows) {
+          const passwordHash = await hashPassword(nr.password);
+          // Do not clear nr.password here — outer finally handles it, inner clear would break retry safety
+          let deliveryAddresses: DeliveryAddress[]|undefined;
+          let activeId: string|null|undefined;
+          if (nr.pincode && nr.line1) {
+            const addr: DeliveryAddress = {
+              addressId: crypto.randomUUID(),
+              label: (nr.label?.toUpperCase() as DeliveryAddress['label']) ?? 'HOME',
+              line1: nr.line1!,
+              city: nr.city,
+              pincode: nr.pincode!,
+              isArchived: false,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            deliveryAddresses = [addr];
+            activeId = addr.addressId;
+          }
+          const user = await userRepository.createCustomerAdmin({
+            fullName: nr.fullName,
+            mobileNumber: nr.mobileNumber,
+            passwordHash,
+            deliveryAddresses,
+            activeDeliveryAddressId: activeId ?? null,
+            milkServiceStatus:'PENDING_ACTIVATION',
+            productOrderServiceStatus:'ACTIVE',
+            mustChangePassword:true,
+            createdBy: actor.id,
+          });
+          await auditLogRepository.record({
+            action:'CUSTOMER_BULK_IMPORTED',
+            actorId: actor.id,
+            actorRole: actor.role,
+            targetUserId: user.id,
+            targetUserCode: user.userCode,
+            targetRole:'CUSTOMER',
+            summary:`Bulk imported customer ${user.userCode}`,
+            metadata:{ mobileNumber: user.mobileNumber, row: nr.row },
+          });
+          local.push(toPublicUserProfile(user));
+        }
+        return local;
+      });
+      created.push(...inMemCreated);
     }
 
     return { imported: created.length, customers: created };
@@ -795,9 +924,9 @@ export const customerManagementService = {
   },
 };
 
-async function updateCustomerFullName(id: string, fullName: string): Promise<import('../models/User').UserEntity> {
+async function updateCustomerFullName(id: string, fullName: string, session?: mongoose.ClientSession): Promise<import('../models/User').UserEntity> {
   if (mongoose.connection.readyState===1) {
-    const doc = await UserModel.findByIdAndUpdate(id, { $set:{ fullName } }, { new:true }).select('+passwordHash').exec();
+    const doc = await UserModel.findByIdAndUpdate(id, { $set:{ fullName } }, { new:true, ...(session ? { session } : {}) }).select('+passwordHash').exec();
     if (!doc) throw new AppError(404,'ACCOUNT_NOT_FOUND','Customer not found');
     return {
       id: doc._id.toString(),

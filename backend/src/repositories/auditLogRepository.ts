@@ -139,8 +139,54 @@ export class InMemoryAuditLogStore {
     return filtered.slice(0, limit).map((l) => ({ ...l }));
   }
 
+  public listPaginated(
+    filter: { targetUserId?: string } = {},
+    page = 1,
+    limit = 20
+  ): { logs: AuditLogEntity[]; total: number } {
+    this.loadFromDisk();
+    const filtered = filter.targetUserId
+      ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
+      : this.logs;
+    const sorted = [...filtered].sort((a, b) => {
+      const diff = b.createdAt.getTime() - a.createdAt.getTime();
+      if (diff !== 0) return diff;
+      return String(b.id).localeCompare(String(a.id));
+    });
+    const total = sorted.length;
+    const start = (page - 1) * limit;
+    return { logs: sorted.slice(start, start + limit).map((l) => ({ ...l })), total };
+  }
+
+  public count(filter: { targetUserId?: string } = {}): number {
+    this.loadFromDisk();
+    if (filter.targetUserId) return this.logs.filter((l) => l.targetUserId === filter.targetUserId).length;
+    return this.logs.length;
+  }
+
+  public getAllForTimeline(filter: { targetUserId?: string } = {}): AuditLogEntity[] {
+    this.loadFromDisk();
+    const filtered = filter.targetUserId
+      ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
+      : this.logs;
+    return [...filtered].sort((a, b) => {
+      const diff = b.createdAt.getTime() - a.createdAt.getTime();
+      if (diff !== 0) return diff;
+      return String(b.id).localeCompare(String(a.id));
+    }).map((l) => ({ ...l }));
+  }
+
   public clear(): void {
     this.logs = [];
+    this.saveToDisk();
+  }
+
+  public snapshot(): AuditLogEntity[] {
+    this.loadFromDisk();
+    return this.logs.map(l=> ({...l}));
+  }
+  public restore(snapshot: AuditLogEntity[]): void {
+    this.logs = snapshot.map(l=> ({...l}));
     this.saveToDisk();
   }
 }
@@ -166,12 +212,25 @@ function assertStoreAvailable(): 'mongo' | 'memory' {
 }
 
 export const auditLogRepository = {
-  async record(input: CreateAuditLogInput): Promise<AuditLogEntity> {
+  async record(input: CreateAuditLogInput, session?: mongoose.ClientSession): Promise<AuditLogEntity> {
     const mode = assertStoreAvailable();
     if (mode === 'memory') {
       return inMemoryAuditLogStore.record(input);
     }
 
+    if (session) {
+      const docs = await AuditLogModel.create([{
+        action: input.action,
+        actorId: input.actorId,
+        actorRole: input.actorRole,
+        targetUserId: input.targetUserId,
+        targetUserCode: input.targetUserCode,
+        targetRole: input.targetRole,
+        summary: input.summary,
+        metadata: input.metadata ?? {},
+      }], { session });
+      return mapDocToEntity(docs[0] as IAuditLogDocument);
+    }
     const doc = await AuditLogModel.create({
       action: input.action,
       actorId: input.actorId,
@@ -200,10 +259,45 @@ export const auditLogRepository = {
     }
 
     const docs = await AuditLogModel.find(query)
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1, _id: -1 })
       .limit(filter.limit ?? 50)
       .exec();
 
+    return docs.map(mapDocToEntity);
+  },
+
+  async count(filter: { targetUserId?: string } = {}): Promise<number> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.count(filter);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    return AuditLogModel.countDocuments(query).exec();
+  },
+
+  async listPaginated(
+    filter: { targetUserId?: string } = {},
+    page = 1,
+    limit = 20
+  ): Promise<{ logs: AuditLogEntity[]; total: number }> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.listPaginated(filter, page, limit);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    const total = await AuditLogModel.countDocuments(query).exec();
+    const docs = await AuditLogModel.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .exec();
+    return { logs: docs.map(mapDocToEntity), total };
+  },
+
+  async getAllForTimeline(filter: { targetUserId?: string } = {}): Promise<AuditLogEntity[]> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryAuditLogStore.getAllForTimeline(filter);
+    const query: Record<string, unknown> = {};
+    if (filter.targetUserId) query.targetUserId = filter.targetUserId;
+    const docs = await AuditLogModel.find(query).sort({ createdAt: -1, _id: -1 }).exec();
     return docs.map(mapDocToEntity);
   },
 };

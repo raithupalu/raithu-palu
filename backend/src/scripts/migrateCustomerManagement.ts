@@ -7,11 +7,15 @@ import { UserModel } from '../models/User';
 /**
  * Additive idempotent migration with explicit confirmation safeguards.
  * - Does NOT auto-change legacy milkServiceStatus to PENDING_ACTIVATION unless explicitly approved
- * - Requires verified backup evidence: --backup-evidence <path> must point to existing backup file/manifest
- *   External backup verification (Atlas snapshot, mongodump checksum) must be completed before operator runs migration.
- *   --confirm-backup alone is NOT verification; it is only operator acknowledgement after external verification.
+ * - Requires operator-supplied backup evidence: --backup-evidence <path> must point to an existing file
+ *   the operator claims is a backup manifest/snapshot identifier (e.g., mongodump checksum file or Atlas
+ *   snapshot ID text file). This file existence/mtime check is NOT proof of backup integrity and does NOT
+ *   verify the backup is restorable — it is only operator-supplied evidence that an external backup
+ *   verification step was performed (via Atlas UI snapshot verification or mongodump --oplog + checksum
+ *   validated out-of-band). --confirm-backup alone is NOT verification; it is only operator acknowledgement.
  * - Exits non-zero if any customer migration fails.
  * - Preserves additive, idempotent behavior and legacy ACTIVE fallback.
+ * - IMPORTANT: This script does NOT execute automatically; operator must run it explicitly after verification.
  */
 async function main() {
   const args = process.argv.slice(2);
@@ -26,8 +30,9 @@ async function main() {
     }
     const resolved = path.resolve(evidencePath);
     if (!fs.existsSync(resolved)) {
-      console.error(`Backup evidence not found at ${resolved}. Provide path to verified backup manifest (e.g., mongodump checksum, Atlas snapshot ID).`);
-      console.error('External backup verification must be completed via Atlas UI or mongodump --oplog + checksum before running migration.');
+      console.error(`Backup evidence not found at ${resolved}. Provide path to operator-supplied evidence file (e.g., mongodump checksum text or Atlas snapshot ID file).`);
+      console.error('NOTE: This check only verifies file existence/mtime — it does NOT prove backup integrity or restorability.');
+      console.error('Operator must have verified backup out-of-band via Atlas UI snapshot check or mongodump --oplog + checksum before running migration.');
       process.exit(1);
     }
     try {
@@ -37,14 +42,16 @@ async function main() {
       if (ageMs > sevenDaysMs) {
         console.warn(`Warning: backup evidence file is older than 7 days (age ${Math.floor(ageMs/3600000)}h). Ensure backup is recent.`);
       }
-      console.info(`Backup evidence verified: ${resolved} (mtime: ${stat.mtime.toISOString()}, size: ${stat.size} bytes)`);
+      console.info(`Backup evidence (operator-supplied) found: ${resolved} (mtime: ${stat.mtime.toISOString()}, size: ${stat.size} bytes)`);
+      console.info('NOTE: File existence is operator evidence only — not proof of backup integrity. External verification must have been completed separately.');
     } catch (e) {
       console.error('Failed to verify backup evidence file:', e);
       process.exit(1);
     }
   } else {
-    console.error('Refusing to run without --backup-evidence <path>. Operator must provide path to verified backup evidence.');
-    console.error('External verification required: Atlas snapshot ID or mongodump checksum file. --confirm-backup alone is operator confirmation, not verification.');
+    console.error('Refusing to run without --backup-evidence <path>. Operator must provide path to operator-supplied backup evidence file.');
+    console.error('This is evidence (file existence) that operator claims external verification was done — not proof of backup integrity.');
+    console.error('External verification required out-of-band: Atlas snapshot ID file or mongodump checksum. --confirm-backup alone is operator confirmation, not verification.');
     process.exit(1);
   }
   // Retain --confirm-backup as additional operator acknowledgement (must be present together with evidence)
