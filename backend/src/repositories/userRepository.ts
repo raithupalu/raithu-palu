@@ -64,17 +64,87 @@ export interface ListAccountsFilter {
   search?: string;
 }
 
-function formatUserCode(role: UserRole, sequenceNumber: number): string {
+export function formatUserCode(role: UserRole, sequenceNumber: number): string {
   const prefix = ROLE_ID_PREFIX[role];
   return `${prefix}-${String(sequenceNumber).padStart(4, '0')}`;
 }
 
-function parseSequenceFromUserCode(userCode: string | undefined, role: UserRole): number {
+export function parseSequenceFromUserCode(
+  userCode: string | undefined,
+  role: UserRole
+): number {
   if (!userCode) return 0;
   const prefix = `${ROLE_ID_PREFIX[role]}-`;
   if (!userCode.startsWith(prefix)) return 0;
   const numericPart = Number.parseInt(userCode.slice(prefix.length), 10);
-  return Number.isFinite(numericPart) ? numericPart : 0;
+  return Number.isFinite(numericPart) && numericPart > 0 ? numericPart : 0;
+}
+
+interface MongoDuplicateErrorShape {
+  code?: number;
+  keyPattern?: Record<string, unknown>;
+  keyValue?: Record<string, unknown>;
+  message?: string;
+  errmsg?: string;
+}
+
+export function isUserCodeDuplicateError(err: unknown): boolean {
+  const mongoErr = err as MongoDuplicateErrorShape | null | undefined;
+  if (!mongoErr || mongoErr.code !== 11000) {
+    return false;
+  }
+  if (mongoErr.keyPattern && 'userCode' in mongoErr.keyPattern) {
+    return true;
+  }
+  if (mongoErr.keyValue && 'userCode' in mongoErr.keyValue) {
+    return true;
+  }
+  const msg = `${mongoErr.errmsg ?? ''} ${mongoErr.message ?? ''}`;
+  return /user_code_unique|\buserCode\b/i.test(msg);
+}
+
+export function isMobileDuplicateError(err: unknown): boolean {
+  const mongoErr = err as MongoDuplicateErrorShape | null | undefined;
+  if (!mongoErr || mongoErr.code !== 11000) {
+    return false;
+  }
+  if (mongoErr.keyPattern && 'mobileNumber' in mongoErr.keyPattern) {
+    return true;
+  }
+  if (mongoErr.keyValue && 'mobileNumber' in mongoErr.keyValue) {
+    return true;
+  }
+  const msg = `${mongoErr.errmsg ?? ''} ${mongoErr.message ?? ''}`;
+  return /user_mobile_unique|\bmobileNumber\b/i.test(msg);
+}
+
+export function mapMongoDuplicateError(
+  err: unknown,
+  mobileConflictMessage: string
+): AppError | null {
+  const mongoErr = err as MongoDuplicateErrorShape | null | undefined;
+  if (!mongoErr || mongoErr.code !== 11000) {
+    return null;
+  }
+  if (isUserCodeDuplicateError(err)) {
+    return new AppError(
+      409,
+      'USER_CODE_CONFLICT',
+      'Could not allocate a unique user code due to concurrent account creation. Please retry.'
+    );
+  }
+  if (isMobileDuplicateError(err)) {
+    return new AppError(
+      409,
+      'MOBILE_ALREADY_REGISTERED',
+      mobileConflictMessage
+    );
+  }
+  return new AppError(
+    409,
+    'MOBILE_ALREADY_REGISTERED',
+    mobileConflictMessage
+  );
 }
 
 function mapDocToEntity(doc: IUserDocument): UserEntity {
@@ -108,13 +178,16 @@ function mapDocToEntity(doc: IUserDocument): UserEntity {
         ? {
             businessContactMobile: doc.farmerProfile.businessContactMobile,
             villageOrLocation: doc.farmerProfile.villageOrLocation,
-            suppliedMilkTypes: [...(doc.farmerProfile.suppliedMilkTypes ?? ['BUFFALO'])],
+            suppliedMilkTypes: [
+              ...(doc.farmerProfile.suppliedMilkTypes ?? ['BUFFALO']),
+            ],
           }
         : undefined,
     grazingWorkerProfile:
       doc.role === 'GRAZING_WORKER' && doc.grazingWorkerProfile
         ? {
-            emergencyContactMobile: doc.grazingWorkerProfile.emergencyContactMobile,
+            emergencyContactMobile:
+              doc.grazingWorkerProfile.emergencyContactMobile,
             assignedNotes: doc.grazingWorkerProfile.assignedNotes,
           }
         : undefined,
@@ -161,11 +234,14 @@ interface SerializedUserEntity
 class InMemoryUserStore {
   private byId = new Map<string, UserEntity>();
   private byMobile = new Map<string, string>();
+  private byUserCode = new Map<string, string>();
+  private roleSequenceFloor = new Map<UserRole, number>();
   private readonly persistFilePath: string;
 
-  constructor() {
+  constructor(customPersistFilePath?: string) {
     const dataDir = path.resolve(process.cwd(), '.data');
-    this.persistFilePath = path.join(dataDir, 'dev-users.json');
+    this.persistFilePath =
+      customPersistFilePath ?? path.join(dataDir, 'dev-users.json');
     this.loadFromDisk();
   }
 
@@ -177,8 +253,8 @@ class InMemoryUserStore {
     );
   }
 
-  private nextUserCodeForRole(role: UserRole): string {
-    let maxSeq = 0;
+  public nextUserCodeForRole(role: UserRole): string {
+    let maxSeq = this.roleSequenceFloor.get(role) ?? 0;
     for (const user of this.byId.values()) {
       if (user.role === role) {
         const seq = parseSequenceFromUserCode(user.userCode, role);
@@ -187,7 +263,9 @@ class InMemoryUserStore {
         }
       }
     }
-    return formatUserCode(role, maxSeq + 1);
+    const nextSeq = maxSeq + 1;
+    this.roleSequenceFloor.set(role, nextSeq);
+    return formatUserCode(role, nextSeq);
   }
 
   private loadFromDisk(): void {
@@ -202,6 +280,8 @@ class InMemoryUserStore {
       const items = JSON.parse(raw) as SerializedUserEntity[];
       this.byId.clear();
       this.byMobile.clear();
+      this.byUserCode.clear();
+      this.roleSequenceFloor.clear();
       let migrated = false;
       for (const item of items) {
         const role: UserRole = item.role || 'CUSTOMER';
@@ -209,6 +289,12 @@ class InMemoryUserStore {
         if (!userCode) {
           userCode = this.nextUserCodeForRole(role);
           migrated = true;
+        } else {
+          const seq = parseSequenceFromUserCode(userCode, role);
+          const prevFloor = this.roleSequenceFloor.get(role) ?? 0;
+          if (seq > prevFloor) {
+            this.roleSequenceFloor.set(role, seq);
+          }
         }
         const entity: UserEntity = {
           ...item,
@@ -221,6 +307,7 @@ class InMemoryUserStore {
         };
         this.byId.set(entity.id, entity);
         this.byMobile.set(entity.mobileNumber, entity.id);
+        this.byUserCode.set(entity.userCode, entity.id);
       }
       if (migrated) {
         this.saveToDisk();
@@ -275,6 +362,11 @@ class InMemoryUserStore {
   public findByUserCode(userCode: string): UserEntity | null {
     this.loadFromDisk();
     const normalized = userCode.trim().toUpperCase();
+    const id = this.byUserCode.get(normalized);
+    if (id) {
+      const found = this.byId.get(id);
+      if (found) return cloneEntity(found);
+    }
     for (const entity of this.byId.values()) {
       if (entity.userCode.toUpperCase() === normalized) {
         return cloneEntity(entity);
@@ -296,6 +388,14 @@ class InMemoryUserStore {
     const now = new Date();
     const id = crypto.randomBytes(12).toString('hex');
     const userCode = this.nextUserCodeForRole('CUSTOMER');
+    if (this.byUserCode.has(userCode)) {
+      throw new AppError(
+        409,
+        'USER_CODE_CONFLICT',
+        'Could not allocate a unique user code due to concurrent account creation. Please retry.'
+      );
+    }
+
     const entity: UserEntity = {
       id,
       userCode,
@@ -315,6 +415,7 @@ class InMemoryUserStore {
 
     this.byId.set(id, entity);
     this.byMobile.set(input.mobileNumber, id);
+    this.byUserCode.set(userCode, id);
     this.saveToDisk();
     return cloneEntity(entity);
   }
@@ -324,22 +425,24 @@ class InMemoryUserStore {
     created: boolean;
   } {
     this.loadFromDisk();
-    const existingId = this.byMobile.get(input.mobileNumber);
-    if (existingId) {
-      const existing = this.byId.get(existingId)!;
-      if (existing.role !== 'ADMIN') {
+
+    // Reject duplicate Admin provisioning: never overwrite an existing Admin or silently create additional Admin accounts
+    for (const user of this.byId.values()) {
+      if (user.role === 'ADMIN') {
         throw new AppError(
           409,
-          'MOBILE_ALREADY_REGISTERED',
-          'This mobile number is already registered to a non-Admin account.'
+          'ADMIN_ALREADY_PROVISIONED',
+          'An Admin account has already been provisioned. Duplicate Admin provisioning is not permitted.'
         );
       }
-      existing.fullName = input.fullName;
-      existing.passwordHash = input.passwordHash;
-      existing.status = 'ACTIVE';
-      existing.updatedAt = new Date();
-      this.saveToDisk();
-      return { user: cloneEntity(existing), created: false };
+    }
+
+    if (this.byMobile.has(input.mobileNumber)) {
+      throw new AppError(
+        409,
+        'MOBILE_ALREADY_REGISTERED',
+        'This mobile number is already registered to a non-Admin account.'
+      );
     }
 
     const now = new Date();
@@ -363,6 +466,7 @@ class InMemoryUserStore {
 
     this.byId.set(id, entity);
     this.byMobile.set(input.mobileNumber, id);
+    this.byUserCode.set(userCode, id);
     this.saveToDisk();
     return { user: cloneEntity(entity), created: true };
   }
@@ -380,6 +484,14 @@ class InMemoryUserStore {
     const now = new Date();
     const id = crypto.randomBytes(12).toString('hex');
     const userCode = this.nextUserCodeForRole(input.role);
+    if (this.byUserCode.has(userCode)) {
+      throw new AppError(
+        409,
+        'USER_CODE_CONFLICT',
+        'Could not allocate a unique user code due to concurrent account creation. Please retry.'
+      );
+    }
+
     const entity: UserEntity = {
       id,
       userCode,
@@ -416,6 +528,7 @@ class InMemoryUserStore {
 
     this.byId.set(id, entity);
     this.byMobile.set(input.mobileNumber, id);
+    this.byUserCode.set(userCode, id);
     this.saveToDisk();
     return cloneEntity(entity);
   }
@@ -551,7 +664,6 @@ class InMemoryUserStore {
     const now = new Date();
     existing.updatedAt = now;
 
-    // Immediately revoke active sessions when account becomes non-ACTIVE
     if (status !== 'ACTIVE') {
       existing.tokenVersion += 1;
       existing.lastLogoutAt = now;
@@ -609,13 +721,21 @@ class InMemoryUserStore {
     passwordHash: string;
     role: UserRole;
     status: UserStatus;
+    userCode?: string;
     staffPermissions?: StaffPermission[];
     farmerProfile?: FarmerProfile;
     grazingWorkerProfile?: GrazingWorkerProfile;
   }): UserEntity {
     const now = new Date();
     const id = crypto.randomBytes(12).toString('hex');
-    const userCode = this.nextUserCodeForRole(params.role);
+    const userCode =
+      params.userCode ?? this.nextUserCodeForRole(params.role);
+    const parsedSeq = parseSequenceFromUserCode(userCode, params.role);
+    const currentFloor = this.roleSequenceFloor.get(params.role) ?? 0;
+    if (parsedSeq > currentFloor) {
+      this.roleSequenceFloor.set(params.role, parsedSeq);
+    }
+
     const entity: UserEntity = {
       id,
       userCode,
@@ -643,6 +763,7 @@ class InMemoryUserStore {
     };
     this.byId.set(id, entity);
     this.byMobile.set(params.mobileNumber, id);
+    this.byUserCode.set(userCode, id);
     this.saveToDisk();
     return cloneEntity(entity);
   }
@@ -650,6 +771,8 @@ class InMemoryUserStore {
   public clear(): void {
     this.byId.clear();
     this.byMobile.clear();
+    this.byUserCode.clear();
+    this.roleSequenceFloor.clear();
     this.saveToDisk();
   }
 }
@@ -674,22 +797,43 @@ function assertStoreAvailable(): 'mongo' | 'memory' {
   );
 }
 
+const mongoRoleSequenceFloor: Record<UserRole, number> = {
+  ADMIN: 0,
+  CUSTOMER: 0,
+  STAFF: 0,
+  FARMER: 0,
+  GRAZING_WORKER: 0,
+};
+
+/**
+ * Generates the next sequential userCode for a role safely across sequences > 9999
+ * (avoiding lexicographical string sort issues where "9999" > "10000") and
+ * reserving monotonically increasing numbers under concurrent in-process calls.
+ */
 async function generateMongoUserCode(role: UserRole): Promise<string> {
   const prefix = ROLE_ID_PREFIX[role];
-  const latestDoc = await UserModel.findOne({
+  const docs = await UserModel.find({
     role,
     userCode: new RegExp(`^${prefix}-\\d+$`),
   })
-    .sort({ userCode: -1 })
     .select('userCode')
     .lean()
     .exec();
 
-  const lastSeq = latestDoc?.userCode
-    ? parseSequenceFromUserCode(latestDoc.userCode, role)
-    : 0;
-  return formatUserCode(role, lastSeq + 1);
+  let maxDbSeq = 0;
+  for (const doc of docs) {
+    const seq = parseSequenceFromUserCode(doc.userCode, role);
+    if (seq > maxDbSeq) {
+      maxDbSeq = seq;
+    }
+  }
+
+  const nextSeq = Math.max(maxDbSeq, mongoRoleSequenceFloor[role] ?? 0) + 1;
+  mongoRoleSequenceFloor[role] = nextSeq;
+  return formatUserCode(role, nextSeq);
 }
+
+const MAX_USER_CODE_RETRIES = 5;
 
 export const userRepository = {
   async findByMobileWithPassword(
@@ -740,33 +884,43 @@ export const userRepository = {
       return inMemoryUserStore.createCustomer(input);
     }
 
-    try {
-      const now = new Date();
-      const userCode = await generateMongoUserCode('CUSTOMER');
-      const created = await UserModel.create({
-        userCode,
-        fullName: input.fullName,
-        mobileNumber: input.mobileNumber,
-        passwordHash: input.passwordHash,
-        role: 'CUSTOMER',
-        status: 'ACTIVE',
-        address: input.address,
-        createdBy: null,
-        tokenVersion: 0,
-        lastLoginAt: now,
-      });
-      return mapDocToEntity(created);
-    } catch (err: unknown) {
-      const mongoErr = err as { code?: number };
-      if (mongoErr && mongoErr.code === 11000) {
-        throw new AppError(
-          409,
-          'MOBILE_ALREADY_REGISTERED',
+    for (let attempt = 1; attempt <= MAX_USER_CODE_RETRIES; attempt += 1) {
+      try {
+        const now = new Date();
+        const userCode = await generateMongoUserCode('CUSTOMER');
+        const created = await UserModel.create({
+          userCode,
+          fullName: input.fullName,
+          mobileNumber: input.mobileNumber,
+          passwordHash: input.passwordHash,
+          role: 'CUSTOMER',
+          status: 'ACTIVE',
+          address: input.address,
+          createdBy: null,
+          tokenVersion: 0,
+          lastLoginAt: now,
+        });
+        return mapDocToEntity(created);
+      } catch (err: unknown) {
+        if (isUserCodeDuplicateError(err) && attempt < MAX_USER_CODE_RETRIES) {
+          continue;
+        }
+        const mapped = mapMongoDuplicateError(
+          err,
           'An account with this mobile number is already registered.'
         );
+        if (mapped) {
+          throw mapped;
+        }
+        throw err;
       }
-      throw err;
     }
+
+    throw new AppError(
+      409,
+      'USER_CODE_CONFLICT',
+      'Could not allocate a unique user code due to concurrent account creation. Please retry.'
+    );
   },
 
   async provisionAdmin(
@@ -777,40 +931,59 @@ export const userRepository = {
       return inMemoryUserStore.provisionAdmin(input);
     }
 
-    const existing = await UserModel.findOne({
-      mobileNumber: input.mobileNumber,
-    })
-      .select('+passwordHash')
+    // Reject duplicate Admin provisioning: never overwrite an existing Admin or silently create additional Admin accounts
+    const existingAdmin = await UserModel.findOne({ role: 'ADMIN' })
+      .select('_id userCode')
+      .lean()
       .exec();
 
-    if (existing) {
-      if (existing.role !== 'ADMIN') {
-        throw new AppError(
-          409,
-          'MOBILE_ALREADY_REGISTERED',
-          'This mobile number is already registered to a non-Admin account.'
-        );
-      }
-      existing.fullName = input.fullName;
-      existing.passwordHash = input.passwordHash;
-      existing.status = 'ACTIVE';
-      await existing.save();
-      return { user: mapDocToEntity(existing), created: false };
+    if (existingAdmin) {
+      throw new AppError(
+        409,
+        'ADMIN_ALREADY_PROVISIONED',
+        'An Admin account has already been provisioned. Duplicate Admin provisioning is not permitted.'
+      );
     }
 
-    const userCode = await generateMongoUserCode('ADMIN');
-    const created = await UserModel.create({
-      userCode,
-      fullName: input.fullName,
+    const existingMobileUser = await UserModel.findOne({
       mobileNumber: input.mobileNumber,
-      passwordHash: input.passwordHash,
-      role: 'ADMIN',
-      status: 'ACTIVE',
-      createdBy: 'SYSTEM_OPERATOR',
-      tokenVersion: 0,
-    });
+    })
+      .select('_id role')
+      .lean()
+      .exec();
 
-    return { user: mapDocToEntity(created), created: true };
+    if (existingMobileUser) {
+      throw new AppError(
+        409,
+        'MOBILE_ALREADY_REGISTERED',
+        'This mobile number is already registered to a non-Admin account.'
+      );
+    }
+
+    try {
+      const userCode = await generateMongoUserCode('ADMIN');
+      const created = await UserModel.create({
+        userCode,
+        fullName: input.fullName,
+        mobileNumber: input.mobileNumber,
+        passwordHash: input.passwordHash,
+        role: 'ADMIN',
+        status: 'ACTIVE',
+        createdBy: 'SYSTEM_OPERATOR',
+        tokenVersion: 0,
+      });
+
+      return { user: mapDocToEntity(created), created: true };
+    } catch (err: unknown) {
+      const mapped = mapMongoDuplicateError(
+        err,
+        'This mobile number is already registered to a non-Admin account.'
+      );
+      if (mapped) {
+        throw mapped;
+      }
+      throw err;
+    }
   },
 
   async createManagedAccount(
@@ -821,40 +994,50 @@ export const userRepository = {
       return inMemoryUserStore.createManagedAccount(input);
     }
 
-    try {
-      const userCode = await generateMongoUserCode(input.role);
-      const created = await UserModel.create({
-        userCode,
-        fullName: input.fullName,
-        mobileNumber: input.mobileNumber,
-        passwordHash: input.passwordHash,
-        role: input.role,
-        status: input.status ?? 'ACTIVE',
-        staffPermissions:
-          input.role === 'STAFF'
-            ? (input.staffPermissions ?? [])
-            : undefined,
-        farmerProfile:
-          input.role === 'FARMER' ? input.farmerProfile : undefined,
-        grazingWorkerProfile:
-          input.role === 'GRAZING_WORKER'
-            ? input.grazingWorkerProfile
-            : undefined,
-        createdBy: input.createdBy,
-        tokenVersion: 0,
-      });
-      return mapDocToEntity(created);
-    } catch (err: unknown) {
-      const mongoErr = err as { code?: number };
-      if (mongoErr && mongoErr.code === 11000) {
-        throw new AppError(
-          409,
-          'MOBILE_ALREADY_REGISTERED',
+    for (let attempt = 1; attempt <= MAX_USER_CODE_RETRIES; attempt += 1) {
+      try {
+        const userCode = await generateMongoUserCode(input.role);
+        const created = await UserModel.create({
+          userCode,
+          fullName: input.fullName,
+          mobileNumber: input.mobileNumber,
+          passwordHash: input.passwordHash,
+          role: input.role,
+          status: input.status ?? 'ACTIVE',
+          staffPermissions:
+            input.role === 'STAFF'
+              ? (input.staffPermissions ?? [])
+              : undefined,
+          farmerProfile:
+            input.role === 'FARMER' ? input.farmerProfile : undefined,
+          grazingWorkerProfile:
+            input.role === 'GRAZING_WORKER'
+              ? input.grazingWorkerProfile
+              : undefined,
+          createdBy: input.createdBy,
+          tokenVersion: 0,
+        });
+        return mapDocToEntity(created);
+      } catch (err: unknown) {
+        if (isUserCodeDuplicateError(err) && attempt < MAX_USER_CODE_RETRIES) {
+          continue;
+        }
+        const mapped = mapMongoDuplicateError(
+          err,
           'An account with this login mobile number is already registered.'
         );
+        if (mapped) {
+          throw mapped;
+        }
+        throw err;
       }
-      throw err;
     }
+
+    throw new AppError(
+      409,
+      'USER_CODE_CONFLICT',
+      'Could not allocate a unique user code due to concurrent account creation. Please retry.'
+    );
   },
 
   async listAccounts(filter: ListAccountsFilter = {}): Promise<UserEntity[]> {
@@ -948,13 +1131,12 @@ export const userRepository = {
 
       return doc ? mapDocToEntity(doc) : null;
     } catch (err: unknown) {
-      const mongoErr = err as { code?: number };
-      if (mongoErr && mongoErr.code === 11000) {
-        throw new AppError(
-          409,
-          'MOBILE_ALREADY_REGISTERED',
-          'An account with this login mobile number is already registered.'
-        );
+      const mapped = mapMongoDuplicateError(
+        err,
+        'An account with this login mobile number is already registered.'
+      );
+      if (mapped) {
+        throw mapped;
       }
       throw err;
     }

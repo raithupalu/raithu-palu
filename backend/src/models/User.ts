@@ -186,7 +186,6 @@ const UserSchema = new Schema<IUserDocument>(
     userCode: {
       type: String,
       required: true,
-      unique: true,
       trim: true,
       match: [
         /^(ADM|CUS|STF|FRM|GRZ)-\d{4,}$/,
@@ -204,7 +203,6 @@ const UserSchema = new Schema<IUserDocument>(
       type: String,
       required: [true, 'Mobile number is required.'],
       trim: true,
-      unique: true,
       match: [
         /^[6-9]\d{9}$/,
         'Mobile number must be a valid 10-digit Indian mobile number starting with 6–9.',

@@ -1,6 +1,9 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 process.env.NODE_ENV = 'test';
 process.env.HOST = '127.0.0.1';
@@ -13,9 +16,21 @@ process.env.BCRYPT_SALT_ROUNDS = '10';
 process.env.ALLOW_IN_MEMORY_AUTH_FALLBACK = 'true';
 
 import { app } from '../app';
-import { inMemoryUserStore } from '../repositories/userRepository';
-import { inMemoryAuditLogStore } from '../repositories/auditLogRepository';
-import { authService } from '../services/authService';
+import { UserModel } from '../models/User';
+import {
+  inMemoryUserStore,
+  mapMongoDuplicateError,
+} from '../repositories/userRepository';
+import {
+  inMemoryAuditLogStore,
+  InMemoryAuditLogStore,
+} from '../repositories/auditLogRepository';
+import { authService, hashPassword } from '../services/authService';
+import {
+  containsForbiddenPasswordCliFlag,
+  resolveProvisionAdminInputs,
+} from '../scripts/provisionAdmin';
+import { AppError } from '../middleware/notFound';
 
 interface JsonResponse {
   status: number;
@@ -758,5 +773,217 @@ describe('Phase 1 Step 2: Admin Account Management Suite', () => {
         .fullName,
       'Lakshmi Narayana Devi'
     );
+  });
+
+  it('9. Fix #1: rejects duplicate Admin provisioning with 409 ADMIN_ALREADY_PROVISIONED without overwriting existing Admin or creating extra Admins', async () => {
+    const existingAdminBefore = inMemoryUserStore.findByMobile('9000000001');
+    assert.ok(existingAdminBefore);
+    assert.equal(existingAdminBefore.fullName, 'Chief Dairy Admin');
+
+    // Attempt to re-provision Admin with the same mobile number and a new password/name
+    await assert.rejects(
+      async () => {
+        await authService.provisionOperatorAdmin({
+          fullName: 'Overwritten Admin Name',
+          mobileNumber: '9000000001',
+          password: 'NewAdminPassword999',
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.statusCode, 409);
+        assert.equal(err.code, 'ADMIN_ALREADY_PROVISIONED');
+        return true;
+      }
+    );
+
+    // Attempt to provision a second Admin with a different mobile number
+    await assert.rejects(
+      async () => {
+        await authService.provisionOperatorAdmin({
+          fullName: 'Second Admin',
+          mobileNumber: '9000000099',
+          password: 'SecondAdminPassword999',
+        });
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.statusCode, 409);
+        assert.equal(err.code, 'ADMIN_ALREADY_PROVISIONED');
+        return true;
+      }
+    );
+
+    // Verify original Admin's name, passwordHash, and status were NOT overwritten
+    const existingAdminAfter = inMemoryUserStore.findByMobile('9000000001');
+    assert.ok(existingAdminAfter);
+    assert.equal(existingAdminAfter.fullName, 'Chief Dairy Admin');
+    assert.equal(
+      existingAdminAfter.passwordHash,
+      existingAdminBefore.passwordHash
+    );
+    assert.equal(existingAdminAfter.status, 'ACTIVE');
+
+    // Verify no second Admin was created
+    const allAdmins = inMemoryUserStore.listAccounts({ role: 'ADMIN' });
+    assert.equal(allAdmins.length, 1);
+  });
+
+  it('10. Fix #2: disables plaintext --password CLI flag in provisionAdmin.ts and reads ADMIN_PASSWORD from environment securely', async () => {
+    assert.equal(
+      containsForbiddenPasswordCliFlag([
+        '--mobile',
+        '9000000001',
+        '--password',
+        'PlaintextSecret123',
+      ]),
+      true
+    );
+    assert.equal(
+      containsForbiddenPasswordCliFlag([
+        '--mobile=9000000001',
+        '--password=PlaintextSecret123',
+      ]),
+      true
+    );
+
+    await assert.rejects(
+      async () => {
+        await resolveProvisionAdminInputs(
+          ['--mobile', '9000000001', '--password', 'PlaintextSecret123'],
+          { NODE_ENV: 'test' }
+        );
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof AppError);
+        assert.equal(err.statusCode, 400);
+        assert.equal(err.code, 'INSECURE_CLI_PASSWORD_FORBIDDEN');
+        return true;
+      }
+    );
+
+    const resolved = await resolveProvisionAdminInputs(
+      ['--mobile', '9000000001', '--name', 'Env Operator Admin'],
+      {
+        NODE_ENV: 'test',
+        ADMIN_PASSWORD: 'EnvSecretPassword123',
+      }
+    );
+    assert.equal(resolved.fullName, 'Env Operator Admin');
+    assert.equal(resolved.mobileNumber, '9000000001');
+    assert.equal(resolved.password, 'EnvSecretPassword123');
+  });
+
+  it('11. Fix #3: avoids duplicate Mongoose index definitions, distinguishes userCode vs mobileNumber 11000 errors, and generates userCodes safely above 9999 and concurrently', async () => {
+    // 1. Verify UserSchema indexes do not declare duplicate userCode or mobileNumber unique indexes
+    const indexes = UserModel.schema.indexes();
+    const userCodeIndexes = indexes.filter(
+      ([fields]) => 'userCode' in fields && Object.keys(fields).length === 1
+    );
+    const mobileIndexes = indexes.filter(
+      ([fields]) =>
+        'mobileNumber' in fields && Object.keys(fields).length === 1
+    );
+    assert.equal(userCodeIndexes.length, 1);
+    assert.equal(mobileIndexes.length, 1);
+
+    // 2. Verify duplicate-key error discrimination (userCode vs mobileNumber)
+    const userCodeErr = mapMongoDuplicateError(
+      {
+        code: 11000,
+        keyPattern: { userCode: 1 },
+        message:
+          'E11000 duplicate key error collection: raithu_palu.users index: user_code_unique dup key: { userCode: "STF-0001" }',
+      },
+      'Mobile conflict fallback'
+    );
+    assert.ok(userCodeErr);
+    assert.equal(userCodeErr.statusCode, 409);
+    assert.equal(userCodeErr.code, 'USER_CODE_CONFLICT');
+
+    const mobileErr = mapMongoDuplicateError(
+      {
+        code: 11000,
+        keyPattern: { mobileNumber: 1 },
+        message:
+          'E11000 duplicate key error collection: raithu_palu.users index: user_mobile_unique dup key: { mobileNumber: "9876543210" }',
+      },
+      'An account with this mobile number is already registered.'
+    );
+    assert.ok(mobileErr);
+    assert.equal(mobileErr.statusCode, 409);
+    assert.equal(mobileErr.code, 'MOBILE_ALREADY_REGISTERED');
+
+    // 3. Verify sequence generation above 9999 (9999 -> 10000 -> 10001)
+    const dummyHash = await hashPassword('Password123');
+    inMemoryUserStore.seedUserForTest({
+      fullName: 'Customer 9999',
+      mobileNumber: '9100009999',
+      passwordHash: dummyHash,
+      role: 'CUSTOMER',
+      status: 'ACTIVE',
+      userCode: 'CUS-9999',
+    });
+
+    const [reg10000, reg10001] = await Promise.all([
+      sendRequest(baseUrl, '/api/auth/customer/register', {
+        method: 'POST',
+        body: {
+          fullName: 'Customer Ten Thousand',
+          mobileNumber: '9100010000',
+          password: 'Password123',
+        },
+      }),
+      sendRequest(baseUrl, '/api/auth/customer/register', {
+        method: 'POST',
+        body: {
+          fullName: 'Customer Ten Thousand One',
+          mobileNumber: '9100010001',
+          password: 'Password123',
+        },
+      }),
+    ]);
+
+    assert.equal(reg10000.status, 201);
+    assert.equal(reg10001.status, 201);
+    const codes = [
+      (reg10000.body.user as { userCode: string }).userCode,
+      (reg10001.body.user as { userCode: string }).userCode,
+    ].sort();
+    assert.deepEqual(codes, ['CUS-10000', 'CUS-10001']);
+  });
+
+  it('12. Fix #4: persists development in-memory audit logs to disk (dev-audit-logs.json) and reloads across store restarts', () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'raithu-palu-audit-test-')
+    );
+    const persistFile = path.join(tmpDir, 'dev-audit-logs.json');
+
+    try {
+      const storeInstance1 = new InMemoryAuditLogStore(persistFile, true);
+      const createdLog = storeInstance1.record({
+        action: 'ACCOUNT_CREATED',
+        actorId: 'admin-1',
+        actorRole: 'ADMIN',
+        targetUserId: 'staff-1',
+        targetUserCode: 'STF-0001',
+        targetRole: 'STAFF',
+        summary: 'Admin ADM-0001 created STAFF account STF-0001.',
+        metadata: { role: 'STAFF' },
+      });
+
+      assert.ok(fs.existsSync(persistFile));
+
+      // Simulate backend restart by instantiating a fresh InMemoryAuditLogStore pointing to the same file
+      const storeInstance2 = new InMemoryAuditLogStore(persistFile, true);
+      const reloadedLogs = storeInstance2.list({ targetUserId: 'staff-1' });
+      assert.equal(reloadedLogs.length, 1);
+      assert.equal(reloadedLogs[0].id, createdLog.id);
+      assert.equal(reloadedLogs[0].action, 'ACCOUNT_CREATED');
+      assert.equal(reloadedLogs[0].targetUserCode, 'STF-0001');
+      assert.ok(reloadedLogs[0].createdAt instanceof Date);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

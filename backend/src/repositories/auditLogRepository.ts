@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import mongoose from 'mongoose';
 import {
   AuditLogModel,
@@ -21,6 +23,10 @@ export interface CreateAuditLogInput {
   metadata?: Record<string, unknown>;
 }
 
+interface SerializedAuditLogEntity extends Omit<AuditLogEntity, 'createdAt'> {
+  createdAt: string;
+}
+
 function mapDocToEntity(doc: IAuditLogDocument): AuditLogEntity {
   return {
     id: doc._id.toString(),
@@ -36,10 +42,75 @@ function mapDocToEntity(doc: IAuditLogDocument): AuditLogEntity {
   };
 }
 
-class InMemoryAuditLogStore {
+export class InMemoryAuditLogStore {
   private logs: AuditLogEntity[] = [];
+  private readonly persistFilePath: string;
+  private readonly forceDiskPersistence: boolean;
+
+  constructor(customPersistFilePath?: string, forceDiskPersistence = false) {
+    const dataDir = path.resolve(process.cwd(), '.data');
+    this.persistFilePath =
+      customPersistFilePath ?? path.join(dataDir, 'dev-audit-logs.json');
+    this.forceDiskPersistence = forceDiskPersistence;
+    this.loadFromDisk();
+  }
+
+  private isDiskPersistenceEnabled(): boolean {
+    if (this.forceDiskPersistence) {
+      return true;
+    }
+    return (
+      process.env.NODE_ENV !== 'test' &&
+      env.NODE_ENV === 'development' &&
+      env.ALLOW_IN_MEMORY_AUTH_FALLBACK
+    );
+  }
+
+  private loadFromDisk(): void {
+    if (!this.isDiskPersistenceEnabled()) {
+      return;
+    }
+    if (!fs.existsSync(this.persistFilePath)) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this.persistFilePath, 'utf8');
+      const items = JSON.parse(raw) as SerializedAuditLogEntity[];
+      this.logs = items.map((item) => ({
+        ...item,
+        metadata: item.metadata ?? {},
+        createdAt: new Date(item.createdAt),
+      }));
+    } catch {
+      // Ignore corrupt dev cache file
+    }
+  }
+
+  private saveToDisk(): void {
+    if (!this.isDiskPersistenceEnabled()) {
+      return;
+    }
+    try {
+      const dir = path.dirname(this.persistFilePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const serialized: SerializedAuditLogEntity[] = this.logs.map((log) => ({
+        ...log,
+        createdAt: log.createdAt.toISOString(),
+      }));
+      fs.writeFileSync(
+        this.persistFilePath,
+        JSON.stringify(serialized, null, 2),
+        'utf8'
+      );
+    } catch {
+      // Ignore disk write errors in restricted environments
+    }
+  }
 
   public record(input: CreateAuditLogInput): AuditLogEntity {
+    this.loadFromDisk();
     const entry: AuditLogEntity = {
       id: crypto.randomBytes(12).toString('hex'),
       action: input.action,
@@ -53,10 +124,14 @@ class InMemoryAuditLogStore {
       createdAt: new Date(),
     };
     this.logs.unshift(entry);
+    this.saveToDisk();
     return { ...entry };
   }
 
-  public list(filter: { targetUserId?: string; limit?: number } = {}): AuditLogEntity[] {
+  public list(
+    filter: { targetUserId?: string; limit?: number } = {}
+  ): AuditLogEntity[] {
+    this.loadFromDisk();
     const limit = filter.limit ?? 50;
     const filtered = filter.targetUserId
       ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
@@ -66,6 +141,7 @@ class InMemoryAuditLogStore {
 
   public clear(): void {
     this.logs = [];
+    this.saveToDisk();
   }
 }
 
