@@ -249,9 +249,6 @@ export function validateTagList(rawTags: unknown): string[] {
   if (!Array.isArray(rawTags)) {
     throw new AppError(400, 'VALIDATION_ERROR', 'Tags must be an array of strings.');
   }
-  if (rawTags.length > 10) {
-    throw new AppError(400, 'VALIDATION_ERROR', 'Maximum 10 tags allowed per customer.');
-  }
   const out: string[] = [];
   const seen = new Set<string>();
   for (const t of rawTags) {

@@ -25,7 +25,7 @@ import {
 
 const ALLOWED_MILK_TRANSITIONS: Record<string, string[]> = {
   'PENDING_ACTIVATION': ['ACTIVE'],
-  'ACTIVE': ['PAUSED', 'STOPPED', 'INACTIVE'], // INACTIVE for schedule? but service status only 4, ignore INACTIVE
+  'ACTIVE': ['PAUSED', 'STOPPED'],
   'PAUSED': ['ACTIVE', 'STOPPED'],
   'STOPPED': ['ACTIVE'],
 };
@@ -193,27 +193,6 @@ export const customerManagementService = {
 
     if (raw.fullName !== undefined) {
       const fn = validateFullName(raw.fullName);
-      // use direct update via repository: we need to implement generic update for customer fullName
-      // Use direct Mongo update
-      if (mongoose.connection.readyState===1) {
-        const doc = await UserModel.findByIdAndUpdate(customerId, { $set:{ fullName: fn } }, { new:true }).select('+passwordHash').exec();
-        if (doc) updated = toPublicUserProfile as unknown as typeof existing; // placeholder, will re-fetch
-        const refreshed = await userRepository.findById(customerId);
-        if (refreshed) updated = refreshed;
-      } else {
-        // in-memory: direct manipulate via repository method for fullName
-        // We'll use generic approach: for in-memory we can access store directly via updateCustomerProfile (which handles fullName)
-        const r = await userRepository.findById(customerId);
-        if (r) {
-          // use internal store method
-          const { inMemoryUserStore } = await import('../repositories/userRepository');
-          // Hack: direct map update
-          (inMemoryUserStore as unknown as Record<string, Map<string,unknown>>);
-        }
-      }
-      // Simpler: use UserModel direct and also inMemory fallback
-      // We'll actually handle via unified logic below by delegating to repository helper
-      // For now, we'll call a helper that updates fullName directly
       updated = await updateCustomerFullName(customerId, fn);
       changedFields.push('fullName');
     }
@@ -448,9 +427,9 @@ export const customerManagementService = {
     let p = Number(page) || 1;
     let l = Number(limit) || 20;
     if (p<1) p=1; if (l<1||l>100) l=20;
-    // Fetch audit logs (up to 200) and notes (up to 200) then merge and paginate
-    const audits = await auditLogRepository.list({ targetUserId: customerId, limit: 200 });
-    const { notes } = await customerNoteRepository.list(customerId, 1, 200);
+    // Fetch complete histories without arbitrary 200 limit — use large limit to retrieve all
+    const audits = await auditLogRepository.list({ targetUserId: customerId, limit: 10000 });
+    const { notes } = await customerNoteRepository.list(customerId, 1, 10000);
     const auditEntries = audits.map(a=> ({ type:'AUDIT', id:a.id, action:a.action, summary:a.summary, metadata:a.metadata, actorId:a.actorId, actorRole:a.actorRole, createdAt:a.createdAt }));
     const noteEntries = notes.map(n=> ({ type:'NOTE', id:n.id, body:n.body, authorCode:n.authorCode, createdAt:n.createdAt }));
     const merged = [...auditEntries, ...noteEntries].sort((a,b)=> new Date(b.createdAt as unknown as string).getTime() - new Date(a.createdAt as unknown as string).getTime());
@@ -537,6 +516,8 @@ export const customerManagementService = {
   },
 
   async bulkImport(actor: PublicUserProfile, buffer: Buffer, filename: string, dryRun = false): Promise<{ imported: number; customers: PublicUserProfile[]; dryRun?: boolean; preview?: Array<Record<string,unknown>> }> {
+    const normalizedRows: Array<{ row:number; fullName:string; mobileNumber:string; password:string; line1?:string; city?:string; pincode?:string; label?:string }> = [];
+    try {
     // Size limits enforced at route level; double-check
     if (buffer.length > 2 * 1024 * 1024) throw new AppError(413,'PAYLOAD_TOO_LARGE','File exceeds 2MB limit');
     // Parse CSV or XLSX
@@ -550,7 +531,6 @@ export const customerManagementService = {
     if (rows.length>500) throw new AppError(400,'VALIDATION_ERROR','File exceeds 500 row limit');
     // Validate rows
     const errors: Array<{ row:number; field:string; code:string; message:string }> = [];
-    const normalizedRows: Array<{ row:number; fullName:string; mobileNumber:string; password:string; line1?:string; city?:string; pincode?:string; label?:string }>=[];
 
     const seenMobiles = new Set<string>();
     for (let i=0;i<rows.length;i++) {
@@ -611,8 +591,7 @@ export const customerManagementService = {
 
     // Dry-run: validate only, no creation
     if (dryRun) {
-      buffer.fill(0);
-      // Return preview without persisting
+      // Return preview without persisting (buffer cleared in finally)
       return { imported: 0, customers: [], dryRun: true, preview: normalizedRows.map(r=> ({ row: r.row, fullName: r.fullName, mobileNumber: r.mobileNumber.slice(0,6)+'****', pincode: r.pincode })) };
     }
     // Transactional creation
@@ -629,7 +608,16 @@ export const customerManagementService = {
     }
 
     const created: PublicUserProfile[] = [];
+    try {
     if (useTransaction) {
+      // Precompute base sequence atomically before transaction to support concurrent imports
+      const existingDocs = await UserModel.find({ role:'CUSTOMER', userCode: new RegExp(`^CUS-\\d+$`) }).select('userCode').lean().exec();
+      let baseMax = 0;
+      for (const d of existingDocs) {
+        const seq = Number.parseInt(d.userCode.slice(4),10);
+        if (!Number.isNaN(seq) && seq > baseMax) baseMax = seq;
+      }
+      let nextSeq = baseMax + 1;
       const session = await mongoose.startSession();
       try {
         await session.withTransaction(async ()=>{
@@ -653,43 +641,45 @@ export const customerManagementService = {
               deliveryAddresses = [addr];
               activeId = addr.addressId;
             }
-            const userCode = await (async ()=>{
-              // Use repository but with session
-              // We'll create via UserModel directly to use session
-              const prefix='CUS';
-              // Generate code via repository logic but need session-aware
-              const docs = await UserModel.find({ role:'CUSTOMER', userCode: new RegExp(`^${prefix}-\\d+$`) }).select('userCode').session(session).lean().exec();
-              let max=0;
-              for (const d of docs) {
-                const seq = Number.parseInt(d.userCode.slice(4),10);
-                if (seq>max) max=seq;
+            // Allocate unique code sequentially within batch, with retry on collision for concurrent imports
+            let doc: typeof UserModel.prototype & { _id: { toString(): string }; userCode: string } | null = null;
+            let attempts = 0;
+            while (!doc && attempts < 5) {
+              const code = `CUS-${String(nextSeq).padStart(4,'0')}`;
+              nextSeq += 1;
+              attempts += 1;
+              try {
+                const createdDocs = await UserModel.create([{
+                  userCode: code,
+                  fullName: nr.fullName,
+                  mobileNumber: nr.mobileNumber,
+                  passwordHash,
+                  role:'CUSTOMER',
+                  status:'ACTIVE',
+                  deliveryAddresses: deliveryAddresses ?? [],
+                  activeDeliveryAddressId: activeId ?? null,
+                  milkServiceStatus:'PENDING_ACTIVATION',
+                  productOrderServiceStatus:'ACTIVE',
+                  mustChangePassword:true,
+                  tags:[],
+                  createdBy: actor.id,
+                  tokenVersion:0,
+                }], { session });
+                doc = createdDocs[0] as unknown as typeof doc;
+              } catch (err: unknown) {
+                const isDup = (err as { code?: number; keyPattern?: Record<string,unknown> })?.code === 11000;
+                const isUserCodeDup = isDup && ((err as { keyPattern?: Record<string,unknown> })?.keyPattern && 'userCode' in ((err as { keyPattern?: Record<string,unknown> })?.keyPattern ?? {}));
+                if (isDup && isUserCodeDup && attempts < 5) {
+                  continue; // retry with next code
+                }
+                // Handle potential string message duplicate
+                const msg = (err as { message?: string })?.message ?? '';
+                if (msg.includes('user_code_unique') && attempts < 5) continue;
+                throw err;
               }
-              // Also consider already created in this transaction
-              max += created.length + 1; // approximate
-              // Simpler: use existing generate but not session aware, risk duplicate but ok for bulk
-              return `${prefix}-${String(max).padStart(4,'0')}`;
-            })();
-            // Actually use UserModel.create with session
-            // To avoid code gen complexity, we'll use UserModel.create and let unique index handle; retry logic not needed for test
-            // Generate deterministic code using repository helper but we need to bypass session floor
-            const code = await generateCodeForBulk(session, created.length);
-            const doc = await UserModel.create([{
-              userCode: code,
-              fullName: nr.fullName,
-              mobileNumber: nr.mobileNumber,
-              passwordHash,
-              role:'CUSTOMER',
-              status:'ACTIVE',
-              deliveryAddresses: deliveryAddresses ?? [],
-              activeDeliveryAddressId: activeId ?? null,
-              milkServiceStatus:'PENDING_ACTIVATION',
-              productOrderServiceStatus:'ACTIVE',
-              mustChangePassword:true,
-              tags:[],
-              createdBy: actor.id,
-              tokenVersion:0,
-            }], { session });
-            const entity = doc[0];
+            }
+            if (!doc) throw new AppError(409,'USER_CODE_CONFLICT','Failed to allocate unique user code after retries');
+            const entity = doc as unknown as { _id: { toString(): string }; userCode: string; fullName: string; mobileNumber: string; passwordHash: string; role: string; status: string; address: unknown; deliveryAddresses: unknown; activeDeliveryAddressId: string | null; milkServiceStatus: unknown; productOrderServiceStatus: unknown; weeklyMilkSchedule: unknown; tags: unknown; mustChangePassword: boolean; createdBy: string | null; tokenVersion: number; lastLoginAt: Date | null; lastLogoutAt: Date | null; createdAt: Date; updatedAt: Date };
             await AuditLogModel.create([{
               action:'CUSTOMER_BULK_IMPORTED',
               actorId: actor.id,
@@ -778,23 +768,32 @@ export const customerManagementService = {
         });
         created.push(toPublicUserProfile(user));
       }
-      buffer.fill(0);
     }
 
     return { imported: created.length, customers: created };
+    } catch (e) {
+      // If transaction failed due to replica set not available, fail clearly, not silently fallback
+      const msg = (e as { message?: string })?.message ?? '';
+      if (msg.includes('Transaction numbers are only allowed') || msg.includes('not a replica set')) {
+        throw new AppError(503, 'TRANSACTIONS_NOT_SUPPORTED', 'MongoDB transactions require a replica set. Configure MONGODB_URI to a replica set (Atlas or rs.initiate).');
+      }
+      throw e;
+    } finally {
+      // Always clear sensitive data (inner)
+      for (const nr of normalizedRows) {
+        try { (nr as unknown as Record<string,unknown>).password = undefined; } catch {}
+      }
+      try { buffer.fill(0); } catch {}
+    }
+    } catch (outerErr) {
+      throw outerErr;
+    } finally {
+      // Outer finally ensures buffer cleared even on validation errors / dryRun early return
+      try { buffer.fill(0); } catch {}
+      for (const nr of normalizedRows) { try { (nr as unknown as Record<string,unknown>).password = undefined; } catch {} }
+    }
   },
 };
-
-async function generateCodeForBulk(session: mongoose.ClientSession, offset: number): Promise<string> {
-  const prefix='CUS';
-  const docs = await UserModel.find({ role:'CUSTOMER' }).select('userCode').session(session).lean().exec();
-  let max=0;
-  for (const d of docs) {
-    const seq = Number.parseInt(d.userCode.slice(4),10);
-    if (!Number.isNaN(seq) && seq>max) max=seq;
-  }
-  return `${prefix}-${String(max + offset + 1).padStart(4,'0')}`;
-}
 
 async function updateCustomerFullName(id: string, fullName: string): Promise<import('../models/User').UserEntity> {
   if (mongoose.connection.readyState===1) {
@@ -843,35 +842,24 @@ async function updateCustomerFullName(id: string, fullName: string): Promise<imp
 }
 
 function parseCsv(buffer: Buffer): Array<Record<string,string>> {
-  const text = buffer.toString('utf8').replace(/^\uFEFF/,'');
-  const lines = text.split(/\r?\n/).filter(l=> l.trim().length>0);
-  if (lines.length<2) return [];
-  const headers = lines[0].split(',').map(h=> h.trim().replace(/^"|"$/g,''));
-  const rows: Array<Record<string,string>> = [];
-  for (let i=1;i<lines.length;i++) {
-    const cols = splitCsvLine(lines[i]);
-    const obj: Record<string,string> = {};
-    for (let j=0;j<headers.length;j++) {
-      obj[headers[j]] = (cols[j] ?? '').trim().replace(/^"|"$/g,'');
-    }
-    rows.push(obj);
+  try {
+    const { parse } = require('csv-parse/sync') as { parse: (input: string, opts: Record<string, unknown>) => Array<Record<string, string>> };
+    const text = buffer.toString('utf8');
+    const records = parse(text, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+      relax_column_count: true,
+      delimiter: ',',
+      quote: '"',
+      escape: '"',
+    }) as Array<Record<string, string>>;
+    return records;
+  } catch (err) {
+    const msg = (err as { message?: string })?.message ?? 'Invalid CSV';
+    throw new AppError(400, 'VALIDATION_ERROR', `CSV parse error: ${msg}`);
   }
-  return rows;
-}
-
-function splitCsvLine(line: string): string[] {
-  const out: string[] = [];
-  let cur='';
-  let inQuotes=false;
-  for (let i=0;i<line.length;i++) {
-    const c=line[i];
-    if (c==='"') {
-      if (inQuotes && line[i+1]==='"') { cur+='"'; i++; } else inQuotes=!inQuotes;
-    } else if (c===',' && !inQuotes) { out.push(cur); cur=''; }
-    else cur+=c;
-  }
-  out.push(cur);
-  return out;
 }
 
 function parseXlsx(buffer: Buffer): Array<Record<string,string>> {

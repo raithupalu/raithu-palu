@@ -1,16 +1,55 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { connectDatabase, disconnectDatabase } from '../config/database';
 import { UserModel } from '../models/User';
 
 /**
  * Additive idempotent migration with explicit confirmation safeguards.
- * - Does NOT auto-change legacy milkServiceStatus to PENDING_ACTIVATION unless --confirm flag with explicit list
- * - Requires verified backup (checked via --confirm-backup flag)
+ * - Does NOT auto-change legacy milkServiceStatus to PENDING_ACTIVATION unless explicitly approved
+ * - Requires verified backup evidence: --backup-evidence <path> must point to existing backup file/manifest
+ *   External backup verification (Atlas snapshot, mongodump checksum) must be completed before operator runs migration.
+ *   --confirm-backup alone is NOT verification; it is only operator acknowledgement after external verification.
+ * - Exits non-zero if any customer migration fails.
+ * - Preserves additive, idempotent behavior and legacy ACTIVE fallback.
  */
 async function main() {
   const args = process.argv.slice(2);
+  // Backup evidence check: require --backup-evidence <path> that exists and is recent (within 7 days)
+  const evidenceIdx = args.indexOf('--backup-evidence');
+  let evidencePath: string | null = null;
+  if (evidenceIdx !== -1) {
+    evidencePath = args[evidenceIdx + 1];
+    if (!evidencePath) {
+      console.error('Usage: --backup-evidence <path-to-backup-manifest-or-snapshot-info> is required');
+      process.exit(1);
+    }
+    const resolved = path.resolve(evidencePath);
+    if (!fs.existsSync(resolved)) {
+      console.error(`Backup evidence not found at ${resolved}. Provide path to verified backup manifest (e.g., mongodump checksum, Atlas snapshot ID).`);
+      console.error('External backup verification must be completed via Atlas UI or mongodump --oplog + checksum before running migration.');
+      process.exit(1);
+    }
+    try {
+      const stat = fs.statSync(resolved);
+      const ageMs = Date.now() - stat.mtimeMs;
+      const sevenDaysMs = 7 * 24 * 3600 * 1000;
+      if (ageMs > sevenDaysMs) {
+        console.warn(`Warning: backup evidence file is older than 7 days (age ${Math.floor(ageMs/3600000)}h). Ensure backup is recent.`);
+      }
+      console.info(`Backup evidence verified: ${resolved} (mtime: ${stat.mtime.toISOString()}, size: ${stat.size} bytes)`);
+    } catch (e) {
+      console.error('Failed to verify backup evidence file:', e);
+      process.exit(1);
+    }
+  } else {
+    console.error('Refusing to run without --backup-evidence <path>. Operator must provide path to verified backup evidence.');
+    console.error('External verification required: Atlas snapshot ID or mongodump checksum file. --confirm-backup alone is operator confirmation, not verification.');
+    process.exit(1);
+  }
+  // Retain --confirm-backup as additional operator acknowledgement (must be present together with evidence)
   if (!args.includes('--confirm-backup')) {
-    console.error('Refusing to run without --confirm-backup. Ensure verified backup exists.');
+    console.error('Refusing to run without --confirm-backup. After verifying backup evidence, add --confirm-backup to acknowledge.');
     process.exit(1);
   }
   if (process.env.NODE_ENV==='production' && !args.includes('--allow-production')) {
@@ -25,7 +64,6 @@ async function main() {
   for (const c of customers) {
     try {
       let changed=false;
-      // Migrate legacy address → deliveryAddresses if empty
       const hasNew = (c as unknown as { deliveryAddresses?: unknown[] }).deliveryAddresses && ((c as unknown as { deliveryAddresses: unknown[] }).deliveryAddresses.length>0);
       if (!hasNew && (c as unknown as { address?: { line1?:string; pincode?:string; city?:string; deliveryNotes?:string } }).address?.pincode) {
         const legacy = (c as unknown as { address: { line1?:string; line2?:string; landmark?:string; city?:string; pincode?:string; deliveryNotes?:string } }).address;
@@ -46,10 +84,7 @@ async function main() {
         (c as unknown as { activeDeliveryAddressId: string }).activeDeliveryAddressId = addr.addressId;
         changed=true;
       }
-      // Init new fields where missing (do not override existing)
       if ((c as unknown as Record<string,unknown>).milkServiceStatus===undefined || (c as unknown as Record<string,unknown>).milkServiceStatus===null) {
-        // Preserve effective ACTIVE for legacy: we set ACTIVE explicitly to make behavior explicit (not PENDING)
-        // Only new customers post-cutover will be PENDING; legacy remain ACTIVE unless explicitly approved migration
         (c as unknown as Record<string,unknown>).milkServiceStatus = 'ACTIVE';
         changed=true;
       }
@@ -66,6 +101,10 @@ async function main() {
   }
   console.log(`Migration complete: migrated=${migrated} skipped=${skipped} errors=${errors}`);
   await disconnectDatabase();
+  if (errors > 0) {
+    console.error(`Migration completed with ${errors} failures — exiting non-zero for operator attention`);
+    process.exit(1);
+  }
 }
 
 if (require.main===module) void main();

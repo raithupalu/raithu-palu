@@ -11,12 +11,14 @@
     "provision:admin": "tsx src/scripts/provisionAdmin.ts",
     "verify:mongo": "node dist/scripts/verifyMongoPersistence.js",
     "verify:mongo:ts": "tsx src/scripts/verifyMongoPersistence.ts",
-    "test": "NODE_ENV=test tsx --test src/__tests__/customerAuth.test.ts src/__tests__/adminAccountManagement.test.ts src/__tests__/unifiedLogin.test.ts src/__tests__/customerManagement.test.ts"
+    "test": "NODE_ENV=test tsx --test src/__tests__/customerAuth.test.ts src/__tests__/adminAccountManagement.test.ts src/__tests__/unifiedLogin.test.ts src/__tests__/customerManagement.test.ts src/__tests__/customerManagementReview.test.ts",
+    "test:tx": "NODE_ENV=test tsx --test src/__tests__/transactionIntegration.test.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
+    "csv-parse": "^7.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^8.7.5",
@@ -34,6 +36,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.3.0",
     "@types/node": "^22.5.0",
+    "mongodb-memory-server": "^11.4.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"
   }

@@ -691,12 +691,8 @@ class InMemoryUserStore {
     if (filter.pincode?.trim()) {
       const p = filter.pincode.trim();
       all = all.filter(u => {
-        if (u.activeDeliveryAddressId) {
-          const active = u.deliveryAddresses.find(a => a.addressId === u.activeDeliveryAddressId);
-          if (active && active.pincode === p) return true;
-        }
         if (u.deliveryAddresses.some(a => a.pincode === p && !a.isArchived)) return true;
-        if (u.address?.pincode === p) return true;
+        if (u.deliveryAddresses.length === 0 && u.address?.pincode === p) return true;
         return false;
       });
     }
@@ -834,7 +830,6 @@ class InMemoryUserStore {
     this.loadFromDisk();
     const u = this.byId.get(id);
     if (!u) return null;
-    if (u.deliveryAddresses.length >= 10) throw new AppError(400,'VALIDATION_ERROR','Maximum 10 delivery addresses allowed.');
     u.deliveryAddresses.push(addr);
     if (!u.activeDeliveryAddressId) u.activeDeliveryAddressId = addr.addressId;
     u.updatedAt = new Date();
@@ -1369,28 +1364,33 @@ export const userRepository = {
     if (mode === 'memory') {
       return inMemoryUserStore.listCustomers(filter);
     }
-    const query: Record<string, unknown> = { role: 'CUSTOMER' };
+    // Build AND semantics: all filters are combined via AND, search is grouped OR
+    const andClauses: Record<string, unknown>[] = [{ role: 'CUSTOMER' }];
     if (filter.search?.trim()) {
       const escaped = filter.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(escaped, 'i');
-      query.$or = [
-        { fullName: regex },
-        { userCode: regex },
-        { mobileNumber: regex },
-      ];
+      andClauses.push({ $or: [{ fullName: regex }, { userCode: regex }, { mobileNumber: regex }] });
     }
-    if (filter.status) query.status = filter.status;
-    if (filter.milkServiceStatus) query.milkServiceStatus = filter.milkServiceStatus;
-    if (filter.productOrderServiceStatus) query.productOrderServiceStatus = filter.productOrderServiceStatus;
+    if (filter.status) andClauses.push({ status: filter.status });
+    if (filter.milkServiceStatus) andClauses.push({ milkServiceStatus: filter.milkServiceStatus });
+    if (filter.productOrderServiceStatus) andClauses.push({ productOrderServiceStatus: filter.productOrderServiceStatus });
     if (filter.pincode?.trim()) {
       const p = filter.pincode.trim();
-      // Match active address pincode or any deliveryAddress pincode or legacy address
-      query.$or = query.$or ? [...(query.$or as unknown[]), { 'deliveryAddresses.pincode': p }, { 'address.pincode': p }] : [{ 'deliveryAddresses.pincode': p }, { 'address.pincode': p }];
-      // For precise activeDeliveryAddress lookup we filter after query in JS fallback if needed
+      // Archived addresses excluded: only non-archived deliveryAddresses or legacy address
+      andClauses.push({
+        $or: [
+          { 'deliveryAddresses': { $elemMatch: { pincode: p, isArchived: false } } },
+          { 'deliveryAddresses.pincode': p, 'deliveryAddresses.isArchived': false },
+          // Fallback for legacy customers without deliveryAddresses array populated: match legacy address where deliveryAddresses empty
+          { 'address.pincode': p, deliveryAddresses: { $size: 0 } },
+          { 'address.pincode': p, deliveryAddresses: { $exists: false } },
+        ],
+      });
     }
     if (filter.tags?.trim()) {
-      query.tags = filter.tags.trim();
+      andClauses.push({ tags: filter.tags.trim() });
     }
+    const query: Record<string, unknown> = andClauses.length === 1 ? andClauses[0] as Record<string, unknown> : { $and: andClauses };
 
     const total = await UserModel.countDocuments(query).exec();
     const page = filter.page ?? 1;
@@ -1401,7 +1401,35 @@ export const userRepository = {
       .skip((page-1)*limit)
       .limit(limit)
       .exec();
-    return { customers: docs.map(mapDocToEntity), total };
+    // Post-filter archived pincode edge: ensure JS-level filter matches in-memory behavior (exclude archived if pincode matches only archived)
+    let customers = docs.map(mapDocToEntity);
+    if (filter.pincode?.trim()) {
+      const p = filter.pincode.trim();
+      customers = customers.filter(u => {
+        // Match non-archived deliveryAddresses
+        if (u.deliveryAddresses.some(a => a.pincode === p && !a.isArchived)) return true;
+        // Legacy fallback when no deliveryAddresses
+        if (u.deliveryAddresses.length === 0 && u.address?.pincode === p) return true;
+        return false;
+      });
+      // Recompute total for accurate pagination when post-filtered (for Mongo, countDocuments already may overcount archived matches)
+      // For correctness, we treat filtered customers length as authoritative for this query type
+      // To keep total accurate, we would need aggregation; for now, use filtered count when pincode filter present
+      // But to avoid breaking pagination total, we compute total via same JS filter on count query (fetch all ids)
+      if (customers.length !== docs.length) {
+        const allMatchingIds = await UserModel.find(query).select('_id').lean().exec();
+        // For total accuracy, we will compute total via JS filtering of all matching docs (limited to pincode case, acceptable for phase 3A scale)
+        const allDocs = await UserModel.find(query).lean().exec();
+        const filteredAll = allDocs.filter((d: unknown) => {
+          const doc = d as { deliveryAddresses?: Array<{ pincode:string; isArchived:boolean }>; address?: { pincode:string } };
+          if (doc.deliveryAddresses?.some(a => a.pincode === p && !a.isArchived)) return true;
+          if ((!doc.deliveryAddresses || doc.deliveryAddresses.length===0) && doc.address?.pincode === p) return true;
+          return false;
+        });
+        return { customers, total: filteredAll.length };
+      }
+    }
+    return { customers, total };
   },
 
   async updateManagedAccount(
@@ -1532,7 +1560,6 @@ export const userRepository = {
     if (!mongoose.Types.ObjectId.isValid(id)) return null;
     const doc = await UserModel.findById(id).exec();
     if (!doc) return null;
-    if ((doc.deliveryAddresses ?? []).length >= 10) throw new AppError(400,'VALIDATION_ERROR','Maximum 10 delivery addresses allowed.');
     const shouldSetActive = !doc.activeDeliveryAddressId;
     const update: Record<string, unknown> = {
       $push: { deliveryAddresses: addr },
