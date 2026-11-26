@@ -53,7 +53,11 @@ class InMemoryNoteStore {
     return { ...e };
   }
   list(customerId: string, limit=20, page=1): { notes: CustomerNoteEntity[]; total:number } {
-    const filtered = this.notes.filter(n=> n.customerId===customerId).sort((a,b)=> b.createdAt.getTime()-a.createdAt.getTime());
+    const filtered = this.notes.filter(n=> n.customerId===customerId).sort((a,b)=> {
+      const diff = b.createdAt.getTime() - a.createdAt.getTime();
+      if (diff !== 0) return diff;
+      return String(b.id).localeCompare(String(a.id));
+    });
     const total = filtered.length;
     const start=(page-1)*limit;
     return { notes: filtered.slice(start, start+limit).map(n=>({...n})), total };
@@ -91,7 +95,7 @@ export const customerNoteRepository = {
     if (mode==='memory') return inMemoryNoteStore.list(customerId, limit, page);
     if (!mongoose.Types.ObjectId.isValid(customerId)) return { notes:[], total:0 };
     const total = await CustomerNoteModel.countDocuments({ customerId }).exec();
-    const docs = await CustomerNoteModel.find({ customerId }).sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit).exec();
+    const docs = await CustomerNoteModel.find({ customerId }).sort({ createdAt:-1, _id:-1 }).skip((page-1)*limit).limit(limit).exec();
     return { notes: docs.map(mapDoc), total };
   }
 };

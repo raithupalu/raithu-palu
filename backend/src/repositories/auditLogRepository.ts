@@ -148,7 +148,11 @@ export class InMemoryAuditLogStore {
     const filtered = filter.targetUserId
       ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
       : this.logs;
-    const sorted = [...filtered].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const sorted = [...filtered].sort((a, b) => {
+      const diff = b.createdAt.getTime() - a.createdAt.getTime();
+      if (diff !== 0) return diff;
+      return String(b.id).localeCompare(String(a.id));
+    });
     const total = sorted.length;
     const start = (page - 1) * limit;
     return { logs: sorted.slice(start, start + limit).map((l) => ({ ...l })), total };
@@ -165,7 +169,11 @@ export class InMemoryAuditLogStore {
     const filtered = filter.targetUserId
       ? this.logs.filter((l) => l.targetUserId === filter.targetUserId)
       : this.logs;
-    return [...filtered].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).map((l) => ({ ...l }));
+    return [...filtered].sort((a, b) => {
+      const diff = b.createdAt.getTime() - a.createdAt.getTime();
+      if (diff !== 0) return diff;
+      return String(b.id).localeCompare(String(a.id));
+    }).map((l) => ({ ...l }));
   }
 
   public clear(): void {
@@ -251,7 +259,7 @@ export const auditLogRepository = {
     }
 
     const docs = await AuditLogModel.find(query)
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1, _id: -1 })
       .limit(filter.limit ?? 50)
       .exec();
 
@@ -277,7 +285,7 @@ export const auditLogRepository = {
     if (filter.targetUserId) query.targetUserId = filter.targetUserId;
     const total = await AuditLogModel.countDocuments(query).exec();
     const docs = await AuditLogModel.find(query)
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
       .exec();
@@ -289,7 +297,7 @@ export const auditLogRepository = {
     if (mode === 'memory') return inMemoryAuditLogStore.getAllForTimeline(filter);
     const query: Record<string, unknown> = {};
     if (filter.targetUserId) query.targetUserId = filter.targetUserId;
-    const docs = await AuditLogModel.find(query).sort({ createdAt: -1 }).exec();
+    const docs = await AuditLogModel.find(query).sort({ createdAt: -1, _id: -1 }).exec();
     return docs.map(mapDocToEntity);
   },
 };

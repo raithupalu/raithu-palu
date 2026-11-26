@@ -160,85 +160,33 @@ export const customerManagementService = {
       weeklyMilkSchedule = schedule;
     }
 
-    // Atomic MongoDB transaction: business mutation + audit together
-    const isMongoForCreate = mongoose.connection.readyState === 1;
-    if (isMongoForCreate) {
-      const session = await mongoose.startSession();
-      let createdUser: import('../models/User').UserEntity | null = null;
-      try {
-        await session.withTransaction(async () => {
-          const user = await userRepository.createCustomerAdmin({
-            fullName,
-            mobileNumber,
-            passwordHash,
-            deliveryAddresses,
-            activeDeliveryAddressId: activeDeliveryAddressId ?? null,
-            milkServiceStatus: 'PENDING_ACTIVATION',
-            productOrderServiceStatus: 'ACTIVE',
-            mustChangePassword: true,
-            tags,
-            weeklyMilkSchedule: weeklyMilkSchedule ?? null,
-            createdBy: actor.id,
-          }, session);
-          createdUser = user;
-          await AuditLogModel.create([{
-            action: 'CUSTOMER_CREATED_BY_ADMIN',
-            actorId: actor.id,
-            actorRole: actor.role,
-            targetUserId: user.id,
-            targetUserCode: user.userCode,
-            targetRole: 'CUSTOMER',
-            summary: `Admin ${actor.userCode} created customer ${user.userCode} (${user.fullName})`,
-            metadata: { mobileNumber: user.mobileNumber, mustChangePassword: true },
-          }], { session });
-        });
-        return toPublicUserProfile(createdUser!);
-      } finally {
-        await session.endSession();
-      }
-    } else {
-      // In-memory atomic with snapshot rollback
-      let createdUser: import('../models/User').UserEntity | null = null;
-      let snapshot: import('../models/User').UserEntity | null = null;
-      try {
-        const user = await userRepository.createCustomerAdmin({
-          fullName,
-          mobileNumber,
-          passwordHash,
-          deliveryAddresses,
-          activeDeliveryAddressId: activeDeliveryAddressId ?? null,
-          milkServiceStatus: 'PENDING_ACTIVATION',
-          productOrderServiceStatus: 'ACTIVE',
-          mustChangePassword: true,
-          tags,
-          weeklyMilkSchedule: weeklyMilkSchedule ?? null,
-          createdBy: actor.id,
-        });
-        createdUser = user;
-        await auditLogRepository.record({
-          action: 'CUSTOMER_CREATED_BY_ADMIN',
-          actorId: actor.id,
-          actorRole: actor.role,
-          targetUserId: user.id,
-          targetUserCode: user.userCode,
-          targetRole: 'CUSTOMER',
-          summary: `Admin ${actor.userCode} created customer ${user.userCode} (${user.fullName})`,
-          metadata: { mobileNumber: user.mobileNumber, mustChangePassword: true },
-        });
-        return toPublicUserProfile(user);
-      } catch (e) {
-        // Rollback: delete created user if audit failed
-        if (createdUser) {
-          try {
-            const store = (inMemoryUserStore as unknown as { byId: Map<string, unknown>; byMobile: Map<string, string>; byUserCode: Map<string, string> });
-            store.byId.delete(createdUser.id);
-            store.byMobile.delete(createdUser.mobileNumber);
-            store.byUserCode.delete(createdUser.userCode.toUpperCase());
-          } catch {}
-        }
-        throw e;
-      }
-    }
+    // Unified atomic creation: Mongo transaction + in-memory snapshot via withAtomicMutation
+    return withAtomicMutation(async (session) => {
+      const user = await userRepository.createCustomerAdmin({
+        fullName,
+        mobileNumber,
+        passwordHash,
+        deliveryAddresses,
+        activeDeliveryAddressId: activeDeliveryAddressId ?? null,
+        milkServiceStatus: 'PENDING_ACTIVATION',
+        productOrderServiceStatus: 'ACTIVE',
+        mustChangePassword: true,
+        tags,
+        weeklyMilkSchedule: weeklyMilkSchedule ?? null,
+        createdBy: actor.id,
+      }, session);
+      await auditLogRepository.record({
+        action: 'CUSTOMER_CREATED_BY_ADMIN',
+        actorId: actor.id,
+        actorRole: actor.role,
+        targetUserId: user.id,
+        targetUserCode: user.userCode,
+        targetRole: 'CUSTOMER',
+        summary: `Admin ${actor.userCode} created customer ${user.userCode} (${user.fullName})`,
+        metadata: { mobileNumber: user.mobileNumber, mustChangePassword: true },
+      }, session);
+      return toPublicUserProfile(user);
+    });
   },
 
   async listCustomers(params: ListParams): Promise<{ customers: PublicUserProfile[]; total: number; page:number; pageSize:number }>{
@@ -557,11 +505,11 @@ export const customerManagementService = {
       // This is DB-level pagination (limit) with correct global ordering and supports >10k
       const needed = p * l;
       const [audits, noteRes] = await Promise.all([
-        AuditLogModel.find({ targetUserId: customerId }).sort({ createdAt: -1 }).limit(needed).lean().exec(),
+        AuditLogModel.find({ targetUserId: customerId }).sort({ createdAt: -1, _id: -1 }).limit(needed).lean().exec(),
         (async () => {
           const { CustomerNoteModel } = await import('../models/CustomerNote');
           return CustomerNoteModel.find({ customerId: new mongoose.Types.ObjectId(customerId) })
-            .sort({ createdAt: -1 })
+            .sort({ createdAt: -1, _id: -1 })
             .limit(needed)
             .lean()
             .exec();
@@ -791,12 +739,13 @@ export const customerManagementService = {
           const seq = Number.parseInt(d.userCode.slice(4),10);
           if (!Number.isNaN(seq) && seq > baseMax) baseMax = seq;
         }
-        let nextSeq = baseMax + 1;
         const session = await mongoose.startSession();
         const attemptCreated: PublicUserProfile[] = [];
         try {
           await session.withTransaction(async ()=>{
-            // Clear any partial attempt state — nextSeq is fresh for this attempt
+            // Driver may retry this callback on TransientTransactionError — every invocation must start fresh.
+            // nextSeq is scoped INSIDE the callback so retries begin at baseMax+1, not a partially-incremented value.
+            let nextSeq = baseMax + 1;
             attemptCreated.length = 0;
             for (const nr of normalizedRows) {
               // Preserve raw password across driver-level retries — do not mutate nr.password
@@ -818,7 +767,7 @@ export const customerManagementService = {
                 deliveryAddresses = [addr];
                 activeId = addr.addressId;
               }
-              // No inner duplicate retry — duplicate aborts transaction and is retried as whole
+              // No inner duplicate retry — duplicate aborts transaction and is retried as whole via outerAttempts
               const code = `CUS-${String(nextSeq).padStart(4,'0')}`;
               nextSeq += 1;
               const createdDocs = await UserModel.create([{
