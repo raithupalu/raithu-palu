@@ -286,6 +286,20 @@ export async function loginAdminApi(
   return normalizeAuthSuccessPayload(raw);
 }
 
+export async function loginUnifiedApi(
+  input: LoginCustomerPayload
+): Promise<AuthSuccessPayload> {
+  const response = await fetch(buildApiUrl('/auth/login'), {
+    method: 'POST',
+    headers: buildAuthHeaders(null, true),
+    credentials: 'include',
+    body: JSON.stringify(input),
+  });
+
+  const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
+  return normalizeAuthSuccessPayload(raw);
+}
+
 export async function logoutCustomerApi(
   accessToken: string | null
 ): Promise<void> {

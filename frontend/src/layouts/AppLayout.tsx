@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiConfig } from '../lib/apiConfig';
 import { useAuth } from '../context/AuthContext';
+import { getDashboardPathForRole } from '../lib/roleRouting';
 
 export function AppLayout() {
   const { user, isAuthenticated, logout } = useAuth();
@@ -14,10 +15,23 @@ export function AppLayout() {
     }`;
 
   async function handleHeaderLogout() {
-    const wasAdmin = user?.role === 'ADMIN';
     await logout();
-    navigate(wasAdmin ? '/admin/login' : '/login', { replace: true });
+    navigate('/login', { replace: true });
   }
+
+  const dashboardPath = user ? getDashboardPathForRole(user.role) : '/login';
+  const dashboardLabel =
+    user?.role === 'ADMIN'
+      ? `Admin (${user.userCode ?? 'ADM'})`
+      : user?.role === 'STAFF'
+        ? `Staff (${user.userCode ?? 'STF'})`
+        : user?.role === 'FARMER'
+          ? `Farmer (${user.userCode ?? 'FRM'})`
+          : user?.role === 'GRAZING_WORKER'
+            ? `Grazing (${user.userCode ?? 'GRZ'})`
+            : user
+              ? `${user.fullName.split(' ')[0]} (${user.userCode ?? 'CUS'})`
+              : 'Dashboard';
 
   return (
     <div className="flex min-h-screen flex-col bg-dairy-cream text-slate-800">
@@ -55,15 +69,9 @@ export function AppLayout() {
 
             {isAuthenticated && user ? (
               <>
-                {user.role === 'ADMIN' ? (
-                  <NavLink to="/admin/accounts" className={navLinkClass}>
-                    Admin Accounts ({user.userCode ?? 'ADM'})
-                  </NavLink>
-                ) : (
-                  <NavLink to="/customer/profile" className={navLinkClass}>
-                    Customer Profile ({user.fullName.split(' ')[0]})
-                  </NavLink>
-                )}
+                <NavLink to={dashboardPath} className={navLinkClass}>
+                  {dashboardLabel}
+                </NavLink>
                 <button
                   type="button"
                   onClick={() => void handleHeaderLogout()}
@@ -75,13 +83,10 @@ export function AppLayout() {
             ) : (
               <>
                 <NavLink to="/login" className={navLinkClass}>
-                  Customer Sign In
+                  Sign In
                 </NavLink>
                 <NavLink to="/register" className={navLinkClass}>
                   Register
-                </NavLink>
-                <NavLink to="/admin/login" className={navLinkClass}>
-                  Admin Console
                 </NavLink>
               </>
             )}

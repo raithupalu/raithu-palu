@@ -17,6 +17,7 @@ import {
   registerCustomerApi,
   loginCustomerApi,
   loginAdminApi,
+  loginUnifiedApi,
   logoutCustomerApi,
   fetchSessionUserApi,
   fetchCustomerProfileApi,
@@ -107,6 +108,7 @@ interface AuthContextValue {
   register: (payload: RegisterCustomerPayload) => Promise<CustomerProfile>;
   login: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
   loginAdmin: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
+  loginUnified: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<CustomerProfile>;
   updateProfile: (payload: UpdateProfilePayload) => Promise<CustomerProfile>;
@@ -247,6 +249,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [persistToken]
   );
 
+  const loginUnified = useCallback(
+    async (payload: LoginCustomerPayload): Promise<CustomerProfile> => {
+      sessionEpochRef.current += 1;
+      setIsLoading(true);
+      setSessionError(null);
+      try {
+        const response = await loginUnifiedApi(payload);
+        persistToken(response.data.accessToken);
+        setUser(response.data.user);
+        setIsInitializing(false);
+        return response.data.user;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [persistToken]
+  );
+
   const logout = useCallback(async (): Promise<void> => {
     sessionEpochRef.current += 1;
     setIsLoading(true);
@@ -320,6 +340,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         register,
         login,
         loginAdmin,
+        loginUnified,
         logout,
         refreshProfile,
         updateProfile,
