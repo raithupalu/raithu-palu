@@ -1,0 +1,29 @@
+name: Mirror mongod
+on:
+  workflow_dispatch:
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download mongod
+        run: |
+          curl -L -o /tmp/mongodb.tgz https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-6.0.14.tgz
+          tar -tzf /tmp/mongodb.tgz | head -20
+          mkdir -p /tmp/extract
+          tar -xzf /tmp/mongodb.tgz -C /tmp/extract --strip-components=1
+          ls -lh /tmp/extract/bin/mongod
+          # Split into chunks <90MB for github push (100MB limit)
+          mkdir -p mongod-bin
+          cp /tmp/extract/bin/mongod mongod-bin/mongod
+          split -b 90M mongod-bin/mongod mongod-bin/mongod.part.
+          ls -lh mongod-bin/
+          # Create commit
+          git config user.name "arena-bot"
+          git config user.email "arena-bot@users.noreply.github.com"
+          git checkout -b mongod-mirror || git checkout mongod-mirror
+          git add mongod-bin/
+          git commit -m "Add mongod 6.0.14 binary chunks for codeload fetch"
+          git push origin mongod-mirror --force
