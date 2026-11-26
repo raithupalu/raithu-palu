@@ -20,5 +20,6 @@ authRouter.post('/login', authController.loginAnyRole);
 // Authenticated session & logout endpoints
 authRouter.post('/logout', requireAuth, authController.logout);
 authRouter.get('/me', requireAuth, authController.getSession);
+authRouter.post('/change-password', requireAuth, authController.changePassword);
 
 export default authRouter;

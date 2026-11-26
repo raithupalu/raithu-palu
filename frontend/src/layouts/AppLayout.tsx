@@ -72,6 +72,11 @@ export function AppLayout() {
                 <NavLink to={dashboardPath} className={navLinkClass}>
                   {dashboardLabel}
                 </NavLink>
+                {user.role === 'ADMIN' && (
+                  <NavLink to="/admin/customers" className={navLinkClass}>
+                    Customers
+                  </NavLink>
+                )}
                 <button
                   type="button"
                   onClick={() => void handleHeaderLogout()}

@@ -446,3 +446,32 @@ export function requireStaffPermission(requiredPermission: StaffPermission) {
     next();
   };
 }
+
+const MUST_CHANGE_ALLOWED = new Set([
+  'GET:/api/auth/me',
+  'POST:/api/auth/logout',
+  'POST:/api/auth/change-password',
+  'POST:/api/customer/change-password',
+  'POST:/api/auth/me',
+]);
+
+export function enforceMustChangePassword(req: Request, _res: Response, next: NextFunction): void {
+  const user = req.authUser as unknown as { mustChangePassword?: boolean } | undefined;
+  if (!user?.mustChangePassword) {
+    next();
+    return;
+  }
+  const key = `${req.method.toUpperCase()}:${req.path}`;
+  // Also check originalUrl fallback
+  const altKey = `${req.method.toUpperCase()}:${req.originalUrl.split('?')[0]}`;
+  if (MUST_CHANGE_ALLOWED.has(key) || MUST_CHANGE_ALLOWED.has(altKey)) {
+    next();
+    return;
+  }
+  const err = new AppError(
+    403,
+    'PASSWORD_CHANGE_REQUIRED',
+    'You must change your initial password before accessing this resource.'
+  );
+  next(err);
+}

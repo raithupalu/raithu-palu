@@ -50,7 +50,7 @@ export function getAllowedPathsForRole(role: UserRole): string[] {
   const base = ROLE_DASHBOARD_PATH[role];
   switch (role) {
     case 'ADMIN':
-      return ['/admin', '/admin/accounts', '/admin/*'];
+      return ['/admin', '/admin/accounts', '/admin/customers', '/admin/*'];
     case 'CUSTOMER':
       return [
         '/customer/dashboard',

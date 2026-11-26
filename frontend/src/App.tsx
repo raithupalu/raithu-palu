@@ -10,6 +10,7 @@ import { CustomerRegisterPage } from './pages/CustomerRegisterPage';
 import { UnifiedLoginPage } from './pages/UnifiedLoginPage';
 import { CustomerProfilePage } from './pages/CustomerProfilePage';
 import { AdminAccountManagementPage } from './pages/AdminAccountManagementPage';
+import { CustomerManagementPage } from './pages/CustomerManagementPage';
 import { StaffDashboardPage } from './pages/StaffDashboardPage';
 import { FarmerDashboardPage } from './pages/FarmerDashboardPage';
 import { GrazingWorkerDashboardPage } from './pages/GrazingWorkerDashboardPage';
@@ -49,6 +50,7 @@ export default function App() {
             {/* ADMIN dashboard */}
             <Route element={<RequireRole roles={['ADMIN']} />}>
               <Route path="admin/accounts" element={<AdminAccountManagementPage />} />
+              <Route path="admin/customers" element={<CustomerManagementPage />} />
               <Route path="admin" element={<AdminAccountManagementPage />} />
             </Route>
 

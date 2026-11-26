@@ -1,6 +1,16 @@
 import { AppError } from '../middleware/notFound';
 import {
   CustomerAddress,
+  DeliveryAddress,
+  DeliveryAddressLabel,
+  VALID_DELIVERY_ADDRESS_LABELS,
+  WeeklyMilkSchedule,
+  WeeklyScheduleStatus,
+  VALID_WEEKLY_SCHEDULE_STATUSES,
+  MilkServiceStatus,
+  VALID_MILK_SERVICE_STATUSES,
+  ProductOrderServiceStatus,
+  VALID_PRODUCT_ORDER_SERVICE_STATUSES,
   ManagedUserRole,
   UserStatus,
   VALID_USER_STATUSES,
@@ -153,6 +163,221 @@ export function validateAccountStatus(rawStatus: unknown): UserStatus {
   return normalized as UserStatus;
 }
 
+export function validateMilkServiceStatus(rawStatus: unknown): MilkServiceStatus {
+  if (typeof rawStatus !== 'string') {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'Milk service status is required and must be one of PENDING_ACTIVATION, ACTIVE, PAUSED, or STOPPED.'
+    );
+  }
+  const normalized = rawStatus.trim().toUpperCase();
+  if (!VALID_MILK_SERVICE_STATUSES.includes(normalized as MilkServiceStatus)) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Invalid milk service status "${rawStatus}". Allowed: ${VALID_MILK_SERVICE_STATUSES.join(', ')}.`
+    );
+  }
+  return normalized as MilkServiceStatus;
+}
+
+export function validateProductOrderServiceStatus(rawStatus: unknown): ProductOrderServiceStatus {
+  if (typeof rawStatus !== 'string') {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'Product order service status is required and must be one of ACTIVE, PAUSED, or STOPPED.'
+    );
+  }
+  const normalized = rawStatus.trim().toUpperCase();
+  if (!VALID_PRODUCT_ORDER_SERVICE_STATUSES.includes(normalized as ProductOrderServiceStatus)) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Invalid product order service status "${rawStatus}". Allowed: ${VALID_PRODUCT_ORDER_SERVICE_STATUSES.join(', ')}.`
+    );
+  }
+  return normalized as ProductOrderServiceStatus;
+}
+
+export function validateWeeklyScheduleStatus(rawStatus: unknown): WeeklyScheduleStatus {
+  if (typeof rawStatus !== 'string') {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      'Weekly schedule status is required and must be one of ACTIVE, INACTIVE, or PAUSED.'
+    );
+  }
+  const normalized = rawStatus.trim().toUpperCase();
+  if (!VALID_WEEKLY_SCHEDULE_STATUSES.includes(normalized as WeeklyScheduleStatus)) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Invalid schedule status "${rawStatus}". Allowed: ${VALID_WEEKLY_SCHEDULE_STATUSES.join(', ')}.`
+    );
+  }
+  return normalized as WeeklyScheduleStatus;
+}
+
+export function validateStatusReason(
+  rawReason: unknown,
+  required: boolean,
+  fieldLabel = 'Reason'
+): string | undefined {
+  if (rawReason === undefined || rawReason === null || rawReason === '') {
+    if (required) {
+      throw new AppError(400, 'VALIDATION_ERROR', `${fieldLabel} is required for this status change and must be at least 10 characters.`);
+    }
+    return undefined;
+  }
+  if (typeof rawReason !== 'string') {
+    throw new AppError(400, 'VALIDATION_ERROR', `${fieldLabel} must be a string.`);
+  }
+  const trimmed = rawReason.trim();
+  if (required && trimmed.length < 10) {
+    throw new AppError(400, 'VALIDATION_ERROR', `${fieldLabel} must be at least 10 characters.`);
+  }
+  if (trimmed.length > 250) {
+    throw new AppError(400, 'VALIDATION_ERROR', `${fieldLabel} cannot exceed 250 characters.`);
+  }
+  return trimmed || undefined;
+}
+
+export function validateTagList(rawTags: unknown): string[] {
+  if (rawTags === undefined || rawTags === null) return [];
+  if (!Array.isArray(rawTags)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Tags must be an array of strings.');
+  }
+  if (rawTags.length > 10) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Maximum 10 tags allowed per customer.');
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const t of rawTags) {
+    if (typeof t !== 'string') throw new AppError(400, 'VALIDATION_ERROR', 'Each tag must be a string.');
+    const trimmed = t.trim();
+    if (!/^[A-Za-z0-9_-]{2,20}$/.test(trimmed)) {
+      throw new AppError(400, 'VALIDATION_ERROR', `Invalid tag "${t}". Tags must be 2-20 chars: A-Za-z0-9_-.`);
+    }
+    const upper = trimmed; // preserve case but deduplicate case-insensitive
+    if (!seen.has(upper.toLowerCase())) {
+      seen.add(upper.toLowerCase());
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+export function validatePagination(raw: { page?: unknown; limit?: unknown; sort?: unknown }): { page: number; limit: number; sort: string } {
+  let page = 1;
+  if (raw.page !== undefined) {
+    const p = Number(raw.page);
+    if (!Number.isInteger(p) || p < 1) throw new AppError(400, 'VALIDATION_ERROR', 'Page must be integer >=1');
+    page = p;
+  }
+  let limit = 20;
+  if (raw.limit !== undefined) {
+    const l = Number(raw.limit);
+    if (!Number.isInteger(l) || l < 1 || l > 100) throw new AppError(400, 'VALIDATION_ERROR', 'Limit must be integer between 1 and 100');
+    limit = l;
+  }
+  const sort = typeof raw.sort === 'string' ? raw.sort.trim() : 'createdAt';
+  return { page, limit, sort };
+}
+
+export function validateDeliveryAddressInput(raw: unknown): Omit<DeliveryAddress, 'addressId' | 'isArchived' | 'createdAt' | 'updatedAt'> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Delivery address must be a valid object.');
+  }
+  const a = raw as Record<string, unknown>;
+  const sanitize = (field: unknown, fieldName: string, maxLen: number, required = false): string | undefined => {
+    if (field === undefined || field === null || field === '') {
+      if (required) throw new AppError(400, 'VALIDATION_ERROR', `Address field "${fieldName}" is required.`);
+      return undefined;
+    }
+    if (typeof field !== 'string') throw new AppError(400, 'VALIDATION_ERROR', `Address field "${fieldName}" must be a string.`);
+    const trimmed = field.trim();
+    if (trimmed.length > maxLen) throw new AppError(400, 'VALIDATION_ERROR', `Address field "${fieldName}" cannot exceed ${maxLen} characters.`);
+    return trimmed || undefined;
+  };
+  const line1 = sanitize(a.line1, 'line1', 150, true);
+  if (!line1) throw new AppError(400, 'VALIDATION_ERROR', 'Address line1 is required.');
+  const pincode = sanitize(a.pincode, 'pincode', 6, true);
+  if (!pincode || !PINCODE_REGEX.test(pincode)) throw new AppError(400, 'VALIDATION_ERROR', 'Pincode must be a valid 6-digit number.');
+
+  let label: DeliveryAddressLabel = 'HOME';
+  if (a.label !== undefined && a.label !== null && a.label !== '') {
+    if (typeof a.label !== 'string') throw new AppError(400, 'VALIDATION_ERROR', 'Address label must be a string.');
+    const norm = a.label.trim().toUpperCase();
+    if (!VALID_DELIVERY_ADDRESS_LABELS.includes(norm as DeliveryAddressLabel)) throw new AppError(400, 'VALIDATION_ERROR', `Invalid label "${a.label}". Allowed: ${VALID_DELIVERY_ADDRESS_LABELS.join(', ')}`);
+    label = norm as DeliveryAddressLabel;
+  }
+
+  return {
+    label,
+    line1: line1!,
+    line2: sanitize(a.line2, 'line2', 150),
+    landmark: sanitize(a.landmark, 'landmark', 120),
+    city: sanitize(a.city, 'city', 80),
+    pincode: pincode!,
+    deliveryNotes: sanitize(a.deliveryNotes, 'deliveryNotes', 250),
+  };
+}
+
+export function validateWeeklyScheduleInput(raw: unknown): {
+  monday: { quantityLitres: number };
+  tuesday: { quantityLitres: number };
+  wednesday: { quantityLitres: number };
+  thursday: { quantityLitres: number };
+  friday: { quantityLitres: number };
+  saturday: { quantityLitres: number };
+  sunday: { quantityLitres: number };
+  status?: WeeklyScheduleStatus;
+  pausedUntil?: Date | null;
+  effectiveFrom?: Date;
+} {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Weekly schedule must be a valid object.');
+  }
+  const o = raw as Record<string, unknown>;
+  const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] as const;
+  const out: Record<string, { quantityLitres: number }> = {};
+  for (const d of days) {
+    const val = o[d];
+    if (val === undefined) {
+      // Allow partial updates: skip if not provided; caller must handle partial vs full
+      continue;
+    }
+    if (!val || typeof val !== 'object' || Array.isArray(val)) throw new AppError(400, 'VALIDATION_ERROR', `Schedule day "${d}" must be an object with quantityLitres.`);
+    const q = (val as Record<string, unknown>).quantityLitres;
+    if (typeof q !== 'number' || !Number.isFinite(q)) throw new AppError(400, 'VALIDATION_ERROR', `Schedule day "${d}" quantityLitres must be a number.`);
+    if (q !== 0 && (q < 0 || Number(q.toFixed(2)) !== q)) throw new AppError(400, 'VALIDATION_ERROR', `Schedule day "${d}" quantityLitres must be 0 or >0 with 0.01 precision.`);
+    if (q < 0) throw new AppError(400, 'VALIDATION_ERROR', `Schedule day "${d}" quantityLitres cannot be negative.`);
+    out[d] = { quantityLitres: q };
+  }
+  let status: WeeklyScheduleStatus | undefined;
+  if (o.status !== undefined) status = validateWeeklyScheduleStatus(o.status);
+  let pausedUntil: Date | null | undefined;
+  if (o.pausedUntil !== undefined) {
+    if (o.pausedUntil === null) pausedUntil = null;
+    else if (typeof o.pausedUntil === 'string') {
+      const d = new Date(o.pausedUntil);
+      if (Number.isNaN(d.getTime())) throw new AppError(400, 'VALIDATION_ERROR', 'pausedUntil must be a valid ISO date string.');
+      pausedUntil = d;
+    } else throw new AppError(400, 'VALIDATION_ERROR', 'pausedUntil must be a date string or null.');
+  }
+  let effectiveFrom: Date | undefined;
+  if (o.effectiveFrom !== undefined) {
+    if (typeof o.effectiveFrom !== 'string') throw new AppError(400, 'VALIDATION_ERROR', 'effectiveFrom must be a date string.');
+    const d = new Date(o.effectiveFrom);
+    if (Number.isNaN(d.getTime())) throw new AppError(400, 'VALIDATION_ERROR', 'effectiveFrom must be valid date.');
+    effectiveFrom = d;
+  }
+  // Return only provided days; service will merge with existing
+  return { ...out, status, pausedUntil, effectiveFrom } as unknown as ReturnType<typeof validateWeeklyScheduleInput>;
+}
+
 export function validateStaffPermissions(
   rawPermissions: unknown
 ): StaffPermission[] {
@@ -287,7 +512,7 @@ export function validateGrazingWorkerProfile(
   if (
     profileObj.emergencyContactMobile !== undefined &&
     profileObj.emergencyContactMobile !== null &&
-    profileObj.emergencyContactMobile !== ''
+    profileObj.emergencyContactMobile !== '' 
   ) {
     emergencyContactMobile = normalizeAndValidateMobileNumber(
       profileObj.emergencyContactMobile,
@@ -299,7 +524,7 @@ export function validateGrazingWorkerProfile(
   if (
     profileObj.assignedNotes !== undefined &&
     profileObj.assignedNotes !== null &&
-    profileObj.assignedNotes !== ''
+    profileObj.assignedNotes !== '' 
   ) {
     if (typeof profileObj.assignedNotes !== 'string') {
       throw new AppError(

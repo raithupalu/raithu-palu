@@ -119,10 +119,6 @@ export function revokeTokenJti(jti: string, exp?: number): void {
 }
 
 export const authService = {
-  /**
-   * Manual Admin Provisioning by an Authorized Technical Operator.
-   * Never exposed via any public registration route.
-   */
   async provisionOperatorAdmin(rawInput: {
     fullName: unknown;
     mobileNumber: unknown;
@@ -193,6 +189,20 @@ export const authService = {
       mobileNumber,
       passwordHash,
       address,
+      milkServiceStatus: 'PENDING_ACTIVATION',
+      productOrderServiceStatus: 'ACTIVE',
+      mustChangePassword: false,
+    });
+
+    await auditLogRepository.record({
+      action: 'ACCOUNT_CREATED',
+      actorId: createdUser.id,
+      actorRole: 'CUSTOMER',
+      targetUserId: createdUser.id,
+      targetUserCode: createdUser.userCode,
+      targetRole: 'CUSTOMER',
+      summary: `Customer ${createdUser.userCode} self-registered.`,
+      metadata: { mobileNumber: createdUser.mobileNumber },
     });
 
     const accessToken = signAccessToken(createdUser);
@@ -299,6 +309,35 @@ export const authService = {
     await userRepository.recordLogout(userId);
   },
 
+  async changePassword(
+    userId: string,
+    rawInput: { currentPassword: unknown; newPassword: unknown }
+  ): Promise<PublicUserProfile> {
+    if (typeof rawInput.currentPassword !== 'string' || !rawInput.currentPassword) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Current password is required.');
+    }
+    const newPassword = validatePasswordStrength(rawInput.newPassword);
+    const user = await userRepository.findById(userId);
+    if (!user) throw new AppError(404, 'USER_NOT_FOUND', 'User not found.');
+    const currentHash = (await userRepository.findByMobileWithPassword(user.mobileNumber))?.passwordHash ?? user.passwordHash;
+    const ok = await verifyPassword(rawInput.currentPassword, currentHash);
+    if (!ok) throw new AppError(401, 'INVALID_CREDENTIALS', 'Current password is incorrect.');
+    const newHash = await hashPassword(newPassword);
+    const updated = await userRepository.changePassword(userId, newHash);
+    if (!updated) throw new AppError(404, 'USER_NOT_FOUND', 'User not found.');
+    await auditLogRepository.record({
+      action: 'PASSWORD_CHANGED',
+      actorId: updated.id,
+      actorRole: updated.role,
+      targetUserId: updated.id,
+      targetUserCode: updated.userCode,
+      targetRole: updated.role,
+      summary: `User ${updated.userCode} changed password.`,
+      metadata: {},
+    });
+    return toPublicUserProfile(updated);
+  },
+
   async getCustomerProfile(userId: string): Promise<PublicUserProfile> {
     const user = await userRepository.findById(userId);
     if (!user) {
@@ -367,6 +406,11 @@ export const authService = {
       'staffPermissions',
       'farmerProfile',
       'grazingWorkerProfile',
+      'milkServiceStatus',
+      'productOrderServiceStatus',
+      'weeklyMilkSchedule',
+      'tags',
+      'mustChangePassword',
     ];
     for (const key of forbiddenKeys) {
       if (key in rawUpdates) {

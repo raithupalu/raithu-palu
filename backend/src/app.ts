@@ -8,6 +8,7 @@ import { env } from './config/env';
 import healthRouter from './routes/health.routes';
 import authRouter from './routes/auth.routes';
 import customerRouter from './routes/customer.routes';
+import customerManagementRouter from './routes/customerManagement.routes';
 import adminRouter from './routes/admin.routes';
 import staffRouter from './routes/staff.routes';
 import { notFoundMiddleware, AppError } from './middleware/notFound';
@@ -71,6 +72,7 @@ export function createApp(): Application {
   app.use('/api/health', healthRouter);
   app.use('/api/auth', authRouter);
   app.use('/api/customer', customerRouter);
+  app.use('/api/admin/customers', customerManagementRouter);
   app.use('/api/admin', adminRouter);
   app.use('/api/staff', staffRouter);
 

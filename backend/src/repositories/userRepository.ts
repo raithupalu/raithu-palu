@@ -10,6 +10,10 @@ import {
   ManagedUserRole,
   UserStatus,
   CustomerAddress,
+  DeliveryAddress,
+  WeeklyMilkSchedule,
+  MilkServiceStatus,
+  ProductOrderServiceStatus,
   StaffPermission,
   FarmerProfile,
   GrazingWorkerProfile,
@@ -23,6 +27,18 @@ export interface CreateCustomerInput {
   mobileNumber: string;
   passwordHash: string;
   address?: CustomerAddress;
+  deliveryAddresses?: DeliveryAddress[];
+  activeDeliveryAddressId?: string | null;
+  milkServiceStatus?: MilkServiceStatus;
+  productOrderServiceStatus?: ProductOrderServiceStatus;
+  mustChangePassword?: boolean;
+  tags?: string[];
+  weeklyMilkSchedule?: WeeklyMilkSchedule | null;
+  createdBy?: string | null;
+}
+
+export interface CreateCustomerAdminInput extends CreateCustomerInput {
+  createdBy: string;
 }
 
 export interface UpdateCustomerProfileInput {
@@ -62,6 +78,18 @@ export interface ListAccountsFilter {
   role?: UserRole | 'ALL_MANAGED';
   status?: UserStatus;
   search?: string;
+}
+
+export interface ListCustomersFilter {
+  search?: string;
+  status?: UserStatus;
+  milkServiceStatus?: MilkServiceStatus;
+  productOrderServiceStatus?: ProductOrderServiceStatus;
+  pincode?: string;
+  tags?: string;
+  page?: number;
+  limit?: number;
+  sort?: string;
 }
 
 export function formatUserCode(role: UserRole, sequenceNumber: number): string {
@@ -169,6 +197,37 @@ function mapDocToEntity(doc: IUserDocument): UserEntity {
           deliveryNotes: doc.address.deliveryNotes,
         }
       : undefined,
+    deliveryAddresses: (doc.deliveryAddresses ?? []).map((a: DeliveryAddress) => ({
+      addressId: a.addressId,
+      label: a.label,
+      line1: a.line1,
+      line2: a.line2,
+      landmark: a.landmark,
+      city: a.city,
+      pincode: a.pincode,
+      deliveryNotes: a.deliveryNotes,
+      isArchived: a.isArchived ?? false,
+      createdAt: a.createdAt,
+      updatedAt: a.updatedAt,
+    })),
+    activeDeliveryAddressId: doc.activeDeliveryAddressId ?? null,
+    milkServiceStatus: (doc.milkServiceStatus as MilkServiceStatus | undefined) ?? null as unknown as MilkServiceStatus,
+    productOrderServiceStatus: (doc.productOrderServiceStatus as ProductOrderServiceStatus | undefined) ?? null as unknown as ProductOrderServiceStatus,
+    weeklyMilkSchedule: doc.weeklyMilkSchedule ? {
+      scheduleId: doc.weeklyMilkSchedule.scheduleId,
+      monday: doc.weeklyMilkSchedule.monday,
+      tuesday: doc.weeklyMilkSchedule.tuesday,
+      wednesday: doc.weeklyMilkSchedule.wednesday,
+      thursday: doc.weeklyMilkSchedule.thursday,
+      friday: doc.weeklyMilkSchedule.friday,
+      saturday: doc.weeklyMilkSchedule.saturday,
+      sunday: doc.weeklyMilkSchedule.sunday,
+      status: doc.weeklyMilkSchedule.status,
+      pausedUntil: doc.weeklyMilkSchedule.pausedUntil,
+      effectiveFrom: doc.weeklyMilkSchedule.effectiveFrom,
+    } : null,
+    tags: [...(doc.tags ?? [])],
+    mustChangePassword: doc.mustChangePassword ?? false,
     staffPermissions:
       doc.role === 'STAFF'
         ? [...(doc.staffPermissions ?? [])]
@@ -204,6 +263,17 @@ function cloneEntity(entity: UserEntity): UserEntity {
   return {
     ...entity,
     address: entity.address ? { ...entity.address } : undefined,
+    deliveryAddresses: entity.deliveryAddresses ? entity.deliveryAddresses.map(a => ({ ...a })) : [],
+    weeklyMilkSchedule: entity.weeklyMilkSchedule ? { ...entity.weeklyMilkSchedule,
+      monday: { ...entity.weeklyMilkSchedule.monday },
+      tuesday: { ...entity.weeklyMilkSchedule.tuesday },
+      wednesday: { ...entity.weeklyMilkSchedule.wednesday },
+      thursday: { ...entity.weeklyMilkSchedule.thursday },
+      friday: { ...entity.weeklyMilkSchedule.friday },
+      saturday: { ...entity.weeklyMilkSchedule.saturday },
+      sunday: { ...entity.weeklyMilkSchedule.sunday },
+    } : null,
+    tags: entity.tags ? [...entity.tags] : [],
     staffPermissions: entity.staffPermissions
       ? [...entity.staffPermissions]
       : undefined,
@@ -300,6 +370,13 @@ class InMemoryUserStore {
           ...item,
           role,
           userCode,
+          deliveryAddresses: (item as unknown as UserEntity).deliveryAddresses ?? [],
+          activeDeliveryAddressId: (item as unknown as UserEntity).activeDeliveryAddressId ?? null,
+          milkServiceStatus: (item as unknown as UserEntity).milkServiceStatus ?? null as unknown as MilkServiceStatus,
+          productOrderServiceStatus: (item as unknown as UserEntity).productOrderServiceStatus ?? null as unknown as ProductOrderServiceStatus,
+          weeklyMilkSchedule: (item as unknown as UserEntity).weeklyMilkSchedule ?? null,
+          tags: (item as unknown as UserEntity).tags ?? [],
+          mustChangePassword: (item as unknown as UserEntity).mustChangePassword ?? false,
           lastLoginAt: item.lastLoginAt ? new Date(item.lastLoginAt) : null,
           lastLogoutAt: item.lastLogoutAt ? new Date(item.lastLogoutAt) : null,
           createdAt: new Date(item.createdAt),
@@ -405,7 +482,14 @@ class InMemoryUserStore {
       role: 'CUSTOMER',
       status: 'ACTIVE',
       address: input.address,
-      createdBy: null,
+      deliveryAddresses: input.deliveryAddresses ?? [],
+      activeDeliveryAddressId: input.activeDeliveryAddressId ?? (input.deliveryAddresses?.[0]?.addressId ?? null),
+      milkServiceStatus: input.milkServiceStatus ?? 'PENDING_ACTIVATION',
+      productOrderServiceStatus: input.productOrderServiceStatus ?? 'ACTIVE',
+      weeklyMilkSchedule: input.weeklyMilkSchedule ?? null,
+      tags: input.tags ?? [],
+      mustChangePassword: input.mustChangePassword ?? false,
+      createdBy: input.createdBy ?? null,
       tokenVersion: 0,
       lastLoginAt: now,
       lastLogoutAt: null,
@@ -426,7 +510,7 @@ class InMemoryUserStore {
   } {
     this.loadFromDisk();
 
-    // Reject duplicate Admin provisioning: never overwrite an existing Admin or silently create additional Admin accounts
+    // Reject duplicate Admin provisioning
     for (const user of this.byId.values()) {
       if (user.role === 'ADMIN') {
         throw new AppError(
@@ -456,6 +540,13 @@ class InMemoryUserStore {
       passwordHash: input.passwordHash,
       role: 'ADMIN',
       status: 'ACTIVE',
+      deliveryAddresses: [],
+      activeDeliveryAddressId: null,
+      milkServiceStatus: null as unknown as MilkServiceStatus,
+      productOrderServiceStatus: null as unknown as ProductOrderServiceStatus,
+      weeklyMilkSchedule: null,
+      tags: [],
+      mustChangePassword: false,
       createdBy: 'SYSTEM_OPERATOR',
       tokenVersion: 0,
       lastLoginAt: null,
@@ -500,6 +591,13 @@ class InMemoryUserStore {
       passwordHash: input.passwordHash,
       role: input.role,
       status: input.status ?? 'ACTIVE',
+      deliveryAddresses: [],
+      activeDeliveryAddressId: null,
+      milkServiceStatus: null as unknown as MilkServiceStatus,
+      productOrderServiceStatus: null as unknown as ProductOrderServiceStatus,
+      weeklyMilkSchedule: null,
+      tags: [],
+      mustChangePassword: false,
       staffPermissions:
         input.role === 'STAFF'
           ? [...(input.staffPermissions ?? [])]
@@ -578,6 +676,45 @@ class InMemoryUserStore {
     return results.sort(
       (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
     );
+  }
+
+  public listCustomers(filter: ListCustomersFilter = {}): { customers: UserEntity[]; total: number } {
+    this.loadFromDisk();
+    let all = Array.from(this.byId.values()).filter(u => u.role === 'CUSTOMER');
+    if (filter.search?.trim()) {
+      const s = filter.search.trim().toLowerCase();
+      all = all.filter(u => u.fullName.toLowerCase().includes(s) || u.userCode.toLowerCase().includes(s) || u.mobileNumber.includes(s));
+    }
+    if (filter.status) all = all.filter(u => u.status === filter.status);
+    if (filter.milkServiceStatus) all = all.filter(u => (u.milkServiceStatus ?? 'ACTIVE') === filter.milkServiceStatus);
+    if (filter.productOrderServiceStatus) all = all.filter(u => (u.productOrderServiceStatus ?? 'ACTIVE') === filter.productOrderServiceStatus);
+    if (filter.pincode?.trim()) {
+      const p = filter.pincode.trim();
+      all = all.filter(u => {
+        if (u.activeDeliveryAddressId) {
+          const active = u.deliveryAddresses.find(a => a.addressId === u.activeDeliveryAddressId);
+          if (active && active.pincode === p) return true;
+        }
+        if (u.deliveryAddresses.some(a => a.pincode === p && !a.isArchived)) return true;
+        if (u.address?.pincode === p) return true;
+        return false;
+      });
+    }
+    if (filter.tags?.trim()) {
+      const t = filter.tags.trim().toLowerCase();
+      all = all.filter(u => u.tags.some(tag => tag.toLowerCase() === t));
+    }
+    // Sort
+    const sortField = filter.sort ?? 'createdAt';
+    if (sortField === 'fullName') all.sort((a,b)=> a.fullName.localeCompare(b.fullName));
+    else all.sort((a,b)=> b.createdAt.getTime() - a.createdAt.getTime());
+
+    const total = all.length;
+    const page = filter.page ?? 1;
+    const limit = filter.limit ?? 20;
+    const start = (page-1)*limit;
+    const paged = all.slice(start, start+limit).map(cloneEntity);
+    return { customers: paged, total };
   }
 
   public updateManagedAccount(
@@ -673,6 +810,130 @@ class InMemoryUserStore {
     return cloneEntity(existing);
   }
 
+  public updateCustomerMobile(
+    id: string,
+    newMobile: string
+  ): UserEntity | null {
+    this.loadFromDisk();
+    const existing = this.byId.get(id);
+    if (!existing) return null;
+    if (existing.mobileNumber !== newMobile) {
+      const conflict = this.byMobile.get(newMobile);
+      if (conflict && conflict !== id) throw new AppError(409,'MOBILE_ALREADY_REGISTERED','An account with this mobile number is already registered.');
+      this.byMobile.delete(existing.mobileNumber);
+      existing.mobileNumber = newMobile;
+      this.byMobile.set(newMobile, id);
+      existing.tokenVersion += 1;
+      existing.updatedAt = new Date();
+      this.saveToDisk();
+    }
+    return cloneEntity(existing);
+  }
+
+  public addDeliveryAddress(id: string, addr: DeliveryAddress): UserEntity | null {
+    this.loadFromDisk();
+    const u = this.byId.get(id);
+    if (!u) return null;
+    if (u.deliveryAddresses.length >= 10) throw new AppError(400,'VALIDATION_ERROR','Maximum 10 delivery addresses allowed.');
+    u.deliveryAddresses.push(addr);
+    if (!u.activeDeliveryAddressId) u.activeDeliveryAddressId = addr.addressId;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public updateDeliveryAddress(id: string, addressId: string, updates: Partial<DeliveryAddress>): UserEntity | null {
+    this.loadFromDisk();
+    const u = this.byId.get(id);
+    if (!u) return null;
+    const idx = u.deliveryAddresses.findIndex(a=> a.addressId===addressId);
+    if (idx===-1) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    if (u.deliveryAddresses[idx].isArchived) throw new AppError(400,'VALIDATION_ERROR','Cannot update an archived address.');
+    u.deliveryAddresses[idx] = { ...u.deliveryAddresses[idx], ...updates, updatedAt: new Date() } as DeliveryAddress;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public setActiveDeliveryAddress(id: string, addressId: string): UserEntity | null {
+    this.loadFromDisk();
+    const u = this.byId.get(id);
+    if (!u) return null;
+    const found = u.deliveryAddresses.find(a=> a.addressId===addressId);
+    if (!found) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    if (found.isArchived) throw new AppError(400,'VALIDATION_ERROR','Cannot activate an archived address.');
+    u.activeDeliveryAddressId = addressId;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public archiveDeliveryAddress(id: string, addressId: string): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    const found = u.deliveryAddresses.find(a=> a.addressId===addressId);
+    if(!found) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    if (u.activeDeliveryAddressId===addressId) throw new AppError(400,'VALIDATION_ERROR','Cannot archive the active delivery address. Switch active address first.');
+    found.isArchived = true;
+    found.updatedAt = new Date();
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public updateMilkServiceStatus(id: string, status: MilkServiceStatus): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    u.milkServiceStatus = status;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public updateProductOrderServiceStatus(id: string, status: ProductOrderServiceStatus): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    u.productOrderServiceStatus = status;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public updateTags(id: string, tags: string[]): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    u.tags = tags;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public setWeeklySchedule(id: string, schedule: WeeklyMilkSchedule): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    u.weeklyMilkSchedule = schedule;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
+  public changePassword(id: string, newHash: string): UserEntity | null {
+    this.loadFromDisk();
+    const u=this.byId.get(id);
+    if(!u) return null;
+    u.passwordHash = newHash;
+    u.mustChangePassword = false;
+    u.tokenVersion += 1;
+    u.updatedAt = new Date();
+    this.saveToDisk();
+    return cloneEntity(u);
+  }
+
   public recordLogin(id: string): UserEntity | null {
     this.loadFromDisk();
     const existing = this.byId.get(id);
@@ -725,6 +986,13 @@ class InMemoryUserStore {
     staffPermissions?: StaffPermission[];
     farmerProfile?: FarmerProfile;
     grazingWorkerProfile?: GrazingWorkerProfile;
+    milkServiceStatus?: MilkServiceStatus;
+    productOrderServiceStatus?: ProductOrderServiceStatus;
+    mustChangePassword?: boolean;
+    deliveryAddresses?: DeliveryAddress[];
+    activeDeliveryAddressId?: string | null;
+    tags?: string[];
+    weeklyMilkSchedule?: WeeklyMilkSchedule | null;
   }): UserEntity {
     const now = new Date();
     const id = crypto.randomBytes(12).toString('hex');
@@ -744,6 +1012,13 @@ class InMemoryUserStore {
       passwordHash: params.passwordHash,
       role: params.role,
       status: params.status,
+      deliveryAddresses: params.deliveryAddresses ?? [],
+      activeDeliveryAddressId: params.activeDeliveryAddressId ?? null,
+      milkServiceStatus: params.milkServiceStatus ?? (params.role==='CUSTOMER' ? 'ACTIVE' as MilkServiceStatus : null as unknown as MilkServiceStatus),
+      productOrderServiceStatus: params.productOrderServiceStatus ?? (params.role==='CUSTOMER' ? 'ACTIVE' as ProductOrderServiceStatus : null as unknown as ProductOrderServiceStatus),
+      weeklyMilkSchedule: params.weeklyMilkSchedule ?? null,
+      tags: params.tags ?? [],
+      mustChangePassword: params.mustChangePassword ?? false,
       staffPermissions:
         params.role === 'STAFF'
           ? [...(params.staffPermissions ?? [])]
@@ -807,7 +1082,7 @@ const mongoRoleSequenceFloor: Record<UserRole, number> = {
 
 /**
  * Generates the next sequential userCode for a role safely across sequences > 9999
- * (avoiding lexicographical string sort issues where "9999" > "10000") and
+ * (avoiding lexicographical string sort issues where \"9999\" > \"10000\") and
  * reserving monotonically increasing numbers under concurrent in-process calls.
  */
 async function generateMongoUserCode(role: UserRole): Promise<string> {
@@ -888,7 +1163,7 @@ export const userRepository = {
       try {
         const now = new Date();
         const userCode = await generateMongoUserCode('CUSTOMER');
-        const created = await UserModel.create({
+        const docToCreate: Record<string, unknown> = {
           userCode,
           fullName: input.fullName,
           mobileNumber: input.mobileNumber,
@@ -896,10 +1171,19 @@ export const userRepository = {
           role: 'CUSTOMER',
           status: 'ACTIVE',
           address: input.address,
-          createdBy: null,
+          deliveryAddresses: input.deliveryAddresses ?? [],
+          activeDeliveryAddressId: input.activeDeliveryAddressId ?? null,
+          milkServiceStatus: input.milkServiceStatus ?? 'PENDING_ACTIVATION',
+          productOrderServiceStatus: input.productOrderServiceStatus ?? 'ACTIVE',
+          weeklyMilkSchedule: input.weeklyMilkSchedule ?? null,
+          tags: input.tags ?? [],
+          mustChangePassword: input.mustChangePassword ?? false,
+          createdBy: input.createdBy ?? null,
           tokenVersion: 0,
           lastLoginAt: now,
-        });
+        };
+        // If deliveryAddresses empty but address present, keep legacy address
+        const created = await UserModel.create(docToCreate);
         return mapDocToEntity(created);
       } catch (err: unknown) {
         if (isUserCodeDuplicateError(err) && attempt < MAX_USER_CODE_RETRIES) {
@@ -923,6 +1207,10 @@ export const userRepository = {
     );
   },
 
+  async createCustomerAdmin(input: CreateCustomerAdminInput): Promise<UserEntity> {
+    return this.createCustomer(input);
+  },
+
   async provisionAdmin(
     input: ProvisionAdminInput
   ): Promise<{ user: UserEntity; created: boolean }> {
@@ -931,7 +1219,6 @@ export const userRepository = {
       return inMemoryUserStore.provisionAdmin(input);
     }
 
-    // Reject duplicate Admin provisioning: never overwrite an existing Admin or silently create additional Admin accounts
     const existingAdmin = await UserModel.findOne({ role: 'ADMIN' })
       .select('_id userCode')
       .lean()
@@ -1077,6 +1364,46 @@ export const userRepository = {
     return docs.map(mapDocToEntity);
   },
 
+  async listCustomers(filter: ListCustomersFilter = {}): Promise<{ customers: UserEntity[]; total: number }> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') {
+      return inMemoryUserStore.listCustomers(filter);
+    }
+    const query: Record<string, unknown> = { role: 'CUSTOMER' };
+    if (filter.search?.trim()) {
+      const escaped = filter.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
+      query.$or = [
+        { fullName: regex },
+        { userCode: regex },
+        { mobileNumber: regex },
+      ];
+    }
+    if (filter.status) query.status = filter.status;
+    if (filter.milkServiceStatus) query.milkServiceStatus = filter.milkServiceStatus;
+    if (filter.productOrderServiceStatus) query.productOrderServiceStatus = filter.productOrderServiceStatus;
+    if (filter.pincode?.trim()) {
+      const p = filter.pincode.trim();
+      // Match active address pincode or any deliveryAddress pincode or legacy address
+      query.$or = query.$or ? [...(query.$or as unknown[]), { 'deliveryAddresses.pincode': p }, { 'address.pincode': p }] : [{ 'deliveryAddresses.pincode': p }, { 'address.pincode': p }];
+      // For precise activeDeliveryAddress lookup we filter after query in JS fallback if needed
+    }
+    if (filter.tags?.trim()) {
+      query.tags = filter.tags.trim();
+    }
+
+    const total = await UserModel.countDocuments(query).exec();
+    const page = filter.page ?? 1;
+    const limit = filter.limit ?? 20;
+    const sortField: Record<string, 1|-1> = filter.sort === 'fullName' ? { fullName: 1 } as unknown as Record<string, 1|-1> : { createdAt: -1 };
+    const docs = await UserModel.find(query)
+      .sort(sortField)
+      .skip((page-1)*limit)
+      .limit(limit)
+      .exec();
+    return { customers: docs.map(mapDocToEntity), total };
+  },
+
   async updateManagedAccount(
     id: string,
     updates: UpdateManagedAccountInput
@@ -1173,6 +1500,134 @@ export const userRepository = {
       .select('+passwordHash')
       .exec();
 
+    return doc ? mapDocToEntity(doc) : null;
+  },
+
+  async updateCustomerMobile(
+    id: string,
+    newMobile: string
+  ): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') {
+      return inMemoryUserStore.updateCustomerMobile(id, newMobile);
+    }
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    try {
+      const doc = await UserModel.findByIdAndUpdate(
+        id,
+        { $set: { mobileNumber: newMobile }, $inc: { tokenVersion: 1 } },
+        { new: true, runValidators: true }
+      ).select('+passwordHash').exec();
+      return doc ? mapDocToEntity(doc) : null;
+    } catch (err: unknown) {
+      const mapped = mapMongoDuplicateError(err, 'An account with this mobile number is already registered.');
+      if (mapped) throw mapped;
+      throw err;
+    }
+  },
+
+  async addDeliveryAddress(id: string, addr: DeliveryAddress): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.addDeliveryAddress(id, addr);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findById(id).exec();
+    if (!doc) return null;
+    if ((doc.deliveryAddresses ?? []).length >= 10) throw new AppError(400,'VALIDATION_ERROR','Maximum 10 delivery addresses allowed.');
+    const shouldSetActive = !doc.activeDeliveryAddressId;
+    const update: Record<string, unknown> = {
+      $push: { deliveryAddresses: addr },
+    };
+    if (shouldSetActive) (update as Record<string, unknown>).$set = { activeDeliveryAddressId: addr.addressId };
+    const updated = await UserModel.findByIdAndUpdate(id, update, { new: true }).select('+passwordHash').exec();
+    return updated ? mapDocToEntity(updated) : null;
+  },
+
+  async updateDeliveryAddress(id: string, addressId: string, updates: Partial<DeliveryAddress>): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.updateDeliveryAddress(id, addressId, updates);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findById(id).exec();
+    if (!doc) return null;
+    const idx = (doc.deliveryAddresses ?? []).findIndex((a: DeliveryAddress) => a.addressId === addressId);
+    if (idx===-1) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    if (doc.deliveryAddresses[idx].isArchived) throw new AppError(400,'VALIDATION_ERROR','Cannot update an archived address.');
+    for (const [k,v] of Object.entries(updates)) {
+      if (v!==undefined) (doc.deliveryAddresses[idx] as unknown as Record<string, unknown>)[k]=v;
+    }
+    (doc.deliveryAddresses[idx] as unknown as Record<string, unknown>).updatedAt = new Date();
+    doc.markModified('deliveryAddresses');
+    await doc.save();
+    const refreshed = await UserModel.findById(id).select('+passwordHash').exec();
+    return refreshed ? mapDocToEntity(refreshed) : null;
+  },
+
+  async setActiveDeliveryAddress(id: string, addressId: string): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.setActiveDeliveryAddress(id, addressId);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findById(id).exec();
+    if (!doc) return null;
+    const found = (doc.deliveryAddresses ?? []).find((a: DeliveryAddress) => a.addressId === addressId);
+    if (!found) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    if (found.isArchived) throw new AppError(400,'VALIDATION_ERROR','Cannot activate an archived address.');
+    const updated = await UserModel.findByIdAndUpdate(id, { $set: { activeDeliveryAddressId: addressId } }, { new: true }).select('+passwordHash').exec();
+    return updated ? mapDocToEntity(updated) : null;
+  },
+
+  async archiveDeliveryAddress(id: string, addressId: string): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.archiveDeliveryAddress(id, addressId);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findById(id).exec();
+    if (!doc) return null;
+    if (doc.activeDeliveryAddressId === addressId) throw new AppError(400,'VALIDATION_ERROR','Cannot archive the active delivery address. Switch active address first.');
+    const idx = (doc.deliveryAddresses ?? []).findIndex((a: DeliveryAddress) => a.addressId===addressId);
+    if (idx===-1) throw new AppError(404,'ADDRESS_NOT_FOUND','Delivery address not found.');
+    doc.deliveryAddresses[idx].isArchived = true;
+    doc.deliveryAddresses[idx].updatedAt = new Date();
+    doc.markModified('deliveryAddresses');
+    await doc.save();
+    const refreshed = await UserModel.findById(id).select('+passwordHash').exec();
+    return refreshed ? mapDocToEntity(refreshed) : null;
+  },
+
+  async updateMilkServiceStatus(id: string, status: MilkServiceStatus): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.updateMilkServiceStatus(id, status);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { milkServiceStatus: status } }, { new: true }).select('+passwordHash').exec();
+    return doc ? mapDocToEntity(doc) : null;
+  },
+
+  async updateProductOrderServiceStatus(id: string, status: ProductOrderServiceStatus): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.updateProductOrderServiceStatus(id, status);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { productOrderServiceStatus: status } }, { new: true }).select('+passwordHash').exec();
+    return doc ? mapDocToEntity(doc) : null;
+  },
+
+  async updateTags(id: string, tags: string[]): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.updateTags(id, tags);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { tags } }, { new: true }).select('+passwordHash').exec();
+    return doc ? mapDocToEntity(doc) : null;
+  },
+
+  async setWeeklySchedule(id: string, schedule: WeeklyMilkSchedule): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.setWeeklySchedule(id, schedule);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { weeklyMilkSchedule: schedule } }, { new: true }).select('+passwordHash').exec();
+    return doc ? mapDocToEntity(doc) : null;
+  },
+
+  async changePassword(id: string, newHash: string): Promise<UserEntity | null> {
+    const mode = assertStoreAvailable();
+    if (mode === 'memory') return inMemoryUserStore.changePassword(id, newHash);
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    const doc = await UserModel.findByIdAndUpdate(id, { $set: { passwordHash: newHash, mustChangePassword: false }, $inc: { tokenVersion: 1 } }, { new: true }).select('+passwordHash').exec();
     return doc ? mapDocToEntity(doc) : null;
   },
 

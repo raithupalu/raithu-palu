@@ -298,4 +298,20 @@ export const authController = {
       next(err);
     }
   },
+
+  async changePassword(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      if (!req.authUser) throw new AppError(401,'AUTHENTICATION_REQUIRED','Authentication required');
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const updated = await authService.changePassword(req.authUser.id, {
+        currentPassword: body.currentPassword,
+        newPassword: body.newPassword,
+      });
+      res.status(200).json({ status:'ok', message:'Password changed successfully', data:{ user: updated } });
+    } catch (err) { next(err); }
+  },
 };

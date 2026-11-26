@@ -41,6 +41,34 @@ export interface GrazingWorkerProfile {
   assignedNotes?: string;
 }
 
+export interface DeliveryAddress {
+  addressId: string;
+  label: 'HOME' | 'OFFICE' | 'OTHER';
+  line1: string;
+  line2?: string;
+  landmark?: string;
+  city?: string;
+  pincode: string;
+  deliveryNotes?: string;
+  isArchived: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface WeeklyMilkSchedule {
+  scheduleId: string;
+  monday: { quantityLitres: number };
+  tuesday: { quantityLitres: number };
+  wednesday: { quantityLitres: number };
+  thursday: { quantityLitres: number };
+  friday: { quantityLitres: number };
+  saturday: { quantityLitres: number };
+  sunday: { quantityLitres: number };
+  status: 'ACTIVE' | 'INACTIVE' | 'PAUSED';
+  pausedUntil?: string | null;
+  effectiveFrom?: string;
+}
+
 export interface CustomerProfile {
   id: string;
   userCode?: string;
@@ -50,6 +78,13 @@ export interface CustomerProfile {
   status: UserStatus;
   statusReason?: string;
   address?: CustomerAddress;
+  deliveryAddresses?: DeliveryAddress[];
+  activeDeliveryAddressId?: string | null;
+  milkServiceStatus?: 'PENDING_ACTIVATION' | 'ACTIVE' | 'PAUSED' | 'STOPPED' | null;
+  productOrderServiceStatus?: 'ACTIVE' | 'PAUSED' | 'STOPPED' | null;
+  weeklyMilkSchedule?: WeeklyMilkSchedule | null;
+  tags?: string[];
+  mustChangePassword?: boolean;
   staffPermissions?: StaffPermission[];
   farmerProfile?: FarmerProfile;
   grazingWorkerProfile?: GrazingWorkerProfile;

@@ -14,12 +14,14 @@ export function errorHandlerMiddleware(
   _next: NextFunction
 ): void {
   if (err instanceof AppError) {
+    const details = (err as unknown as Record<string, unknown>).details ?? (err as unknown as Record<string, unknown>).errors ? { errors: (err as unknown as Record<string, unknown>).errors, details: (err as unknown as Record<string, unknown>).details } : undefined;
     res.status(err.statusCode).json({
       status: 'error',
       code: err.code,
       message: err.message,
       path: req.originalUrl,
       timestamp: new Date().toISOString(),
+      ...(details ? { errors: (err as unknown as Record<string, unknown>).errors, details: (err as unknown as Record<string, unknown>).details } : {}),
     });
     return;
   }
