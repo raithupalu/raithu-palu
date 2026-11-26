@@ -9,6 +9,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "provision:admin": "tsx src/scripts/provisionAdmin.ts",
+    "verify:mongo": "node dist/scripts/verifyMongoPersistence.js",
+    "verify:mongo:ts": "tsx src/scripts/verifyMongoPersistence.ts",
     "test": "NODE_ENV=test tsx --test src/__tests__/customerAuth.test.ts src/__tests__/adminAccountManagement.test.ts"
   },
   "dependencies": {
