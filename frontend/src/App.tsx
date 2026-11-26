@@ -21,6 +21,9 @@ export default function App() {
             <Route path="login" element={<CustomerLoginPage />} />
             <Route element={<ProtectedRoute />}>
               <Route path="customer/profile" element={<CustomerProfilePage />} />
+              <Route path="customer/dashboard" element={<CustomerProfilePage />} />
+              <Route path="dashboard" element={<CustomerProfilePage />} />
+              <Route path="profile" element={<CustomerProfilePage />} />
             </Route>
             <Route path="*" element={<NotFoundPage />} />
           </Route>

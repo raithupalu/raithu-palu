@@ -332,4 +332,54 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
     assert.equal(afterLogoutRes.status, 401);
     assert.equal(afterLogoutRes.body.code, 'TOKEN_REVOKED');
   });
+
+  it('supports cookie-based session restoration and ignores malformed Bearer undefined/null headers', async () => {
+    await sendRequest(baseUrl, '/api/auth/customer/register', {
+      method: 'POST',
+      body: {
+        fullName: 'Padma R',
+        mobileNumber: '9555666777',
+        password: 'CookieSession123',
+      },
+    });
+
+    const loginRes = await fetch(`${baseUrl}/api/auth/customer/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mobileNumber: '9555666777',
+        password: 'CookieSession123',
+      }),
+    });
+    assert.equal(loginRes.status, 200);
+
+    const setCookie = loginRes.headers.get('set-cookie') ?? '';
+    assert.match(setCookie, /rp_access_token=/);
+    assert.match(setCookie, /HttpOnly/i);
+    const cookiePair = setCookie.split(';')[0];
+
+    // Profile request using only httpOnly cookie (simulating page refresh when token storage is absent)
+    const cookieOnlyProfileRes = await fetch(
+      `${baseUrl}/api/customer/profile`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Cookie: cookiePair,
+        },
+      }
+    );
+    assert.equal(cookieOnlyProfileRes.status, 200);
+
+    // Profile request where Authorization header is "Bearer undefined" but cookie is valid
+    const malformedBearerRes = await fetch(`${baseUrl}/api/customer/profile`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer undefined',
+        Cookie: cookiePair,
+      },
+    });
+    assert.equal(malformedBearerRes.status, 200);
+  });
 });

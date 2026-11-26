@@ -4,6 +4,7 @@ import {
   useState,
   useEffect,
   useCallback,
+  useRef,
   type ReactNode,
 } from 'react';
 import {
@@ -11,6 +12,7 @@ import {
   type RegisterCustomerPayload,
   type LoginCustomerPayload,
   type UpdateProfilePayload,
+  ApiRequestError,
   registerCustomerApi,
   loginCustomerApi,
   logoutCustomerApi,
@@ -20,11 +22,55 @@ import {
 
 const TOKEN_STORAGE_KEY = 'rp_customer_access_token';
 
+function readStoredToken(): string | null {
+  try {
+    const localToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    if (localToken && localToken !== 'undefined' && localToken !== 'null') {
+      return localToken;
+    }
+    const sessionToken = window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    if (
+      sessionToken &&
+      sessionToken !== 'undefined' &&
+      sessionToken !== 'null'
+    ) {
+      return sessionToken;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredToken(token: string | null): void {
+  try {
+    if (token && token !== 'undefined' && token !== 'null') {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } else {
+      window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage access errors in restricted browsers
+  }
+}
+
+function isDefinitiveAuthRejection(err: unknown): boolean {
+  return (
+    err instanceof ApiRequestError &&
+    (err.statusCode === 401 || err.statusCode === 403)
+  );
+}
+
 interface AuthContextValue {
   user: CustomerProfile | null;
   accessToken: string | null;
   isAuthenticated: boolean;
   isInitializing: boolean;
+  isLoading: boolean;
+  sessionError: string | null;
+  clearSessionError: () => void;
   register: (payload: RegisterCustomerPayload) => Promise<CustomerProfile>;
   login: (payload: LoginCustomerPayload) => Promise<CustomerProfile>;
   logout: () => Promise<void>;
@@ -36,98 +82,160 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<CustomerProfile | null>(null);
-  const [accessToken, setAccessToken] = useState<string | null>(() => {
-    try {
-      return window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  });
+  const [accessToken, setAccessToken] = useState<string | null>(() =>
+    readStoredToken()
+  );
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const hasRestoredOnMount = useRef<boolean>(false);
 
   const persistToken = useCallback((token: string | null) => {
     setAccessToken(token);
-    try {
-      if (token) {
-        window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-      } else {
-        window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore storage access errors in restricted browsers
-    }
+    writeStoredToken(token);
+  }, []);
+
+  const clearSessionError = useCallback(() => {
+    setSessionError(null);
   }, []);
 
   useEffect(() => {
+    if (hasRestoredOnMount.current) {
+      return;
+    }
+    hasRestoredOnMount.current = true;
+
     let active = true;
-    async function restoreSession() {
-      if (!accessToken) {
-        if (active) setIsInitializing(false);
-        return;
-      }
+    async function restoreInitialSession() {
+      const initialToken = readStoredToken();
+      setIsInitializing(true);
+      setIsLoading(true);
 
       try {
-        const profile = await fetchCustomerProfileApi(accessToken);
+        // Attempt profile fetch using stored Bearer token and/or httpOnly cookie
+        const profile = await fetchCustomerProfileApi(initialToken);
         if (active) {
           setUser(profile);
+          setSessionError(null);
         }
-      } catch {
-        if (active) {
+      } catch (err) {
+        if (!active) return;
+
+        if (isDefinitiveAuthRejection(err)) {
           setUser(null);
-          persistToken(null);
+          if (initialToken) {
+            persistToken(null);
+          }
+          setSessionError(null);
+        } else {
+          // Do not treat transient network/server errors as a logout when a token exists
+          if (initialToken) {
+            setSessionError(
+              err instanceof Error
+                ? err.message
+                : 'Unable to verify customer session at this moment.'
+            );
+          }
         }
       } finally {
         if (active) {
           setIsInitializing(false);
+          setIsLoading(false);
         }
       }
     }
 
-    void restoreSession();
+    void restoreInitialSession();
     return () => {
       active = false;
     };
-  }, [accessToken, persistToken]);
+  }, [persistToken]);
 
   const register = useCallback(
     async (payload: RegisterCustomerPayload): Promise<CustomerProfile> => {
-      const response = await registerCustomerApi(payload);
-      persistToken(response.data.accessToken);
-      setUser(response.data.user);
-      return response.data.user;
+      setIsLoading(true);
+      setSessionError(null);
+      try {
+        const response = await registerCustomerApi(payload);
+        persistToken(response.data.accessToken);
+        setUser(response.data.user);
+        setIsInitializing(false);
+        return response.data.user;
+      } finally {
+        setIsLoading(false);
+      }
     },
     [persistToken]
   );
 
   const login = useCallback(
     async (payload: LoginCustomerPayload): Promise<CustomerProfile> => {
-      const response = await loginCustomerApi(payload);
-      persistToken(response.data.accessToken);
-      setUser(response.data.user);
-      return response.data.user;
+      setIsLoading(true);
+      setSessionError(null);
+      try {
+        const response = await loginCustomerApi(payload);
+        persistToken(response.data.accessToken);
+        setUser(response.data.user);
+        setIsInitializing(false);
+        return response.data.user;
+      } finally {
+        setIsLoading(false);
+      }
     },
     [persistToken]
   );
 
   const logout = useCallback(async (): Promise<void> => {
+    setIsLoading(true);
     try {
-      await logoutCustomerApi(accessToken);
+      const currentToken = accessToken ?? readStoredToken();
+      await logoutCustomerApi(currentToken);
+    } catch {
+      // Even if server token already expired, complete local cleanup
     } finally {
       setUser(null);
       persistToken(null);
+      setSessionError(null);
+      setIsLoading(false);
     }
   }, [accessToken, persistToken]);
 
   const refreshProfile = useCallback(async (): Promise<CustomerProfile> => {
-    const profile = await fetchCustomerProfileApi(accessToken);
-    setUser(profile);
-    return profile;
-  }, [accessToken]);
+    const currentToken = accessToken ?? readStoredToken();
+    setIsLoading(true);
+    setSessionError(null);
+    try {
+      const profile = await fetchCustomerProfileApi(currentToken);
+      setUser(profile);
+      return profile;
+    } catch (err) {
+      if (isDefinitiveAuthRejection(err)) {
+        setUser(null);
+        persistToken(null);
+        setSessionError(
+          err instanceof Error
+            ? err.message
+            : 'Your session has expired. Please sign in again.'
+        );
+      } else {
+        setSessionError(
+          err instanceof Error
+            ? err.message
+            : 'Unable to refresh customer profile.'
+        );
+      }
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [accessToken, persistToken]);
 
   const updateProfile = useCallback(
     async (payload: UpdateProfilePayload): Promise<CustomerProfile> => {
-      const updated = await updateCustomerProfileApi(accessToken, payload);
+      const currentToken = accessToken ?? readStoredToken();
+      const updated = await updateCustomerProfileApi(currentToken, payload);
       setUser(updated);
+      setSessionError(null);
       return updated;
     },
     [accessToken]
@@ -138,8 +246,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       value={{
         user,
         accessToken,
-        isAuthenticated: Boolean(user && accessToken),
+        isAuthenticated: Boolean(user && user.status === 'ACTIVE'),
         isInitializing,
+        isLoading,
+        sessionError,
+        clearSessionError,
         register,
         login,
         logout,

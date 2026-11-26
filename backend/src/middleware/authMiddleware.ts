@@ -26,7 +26,7 @@ export function extractRequestToken(req: Request): string | null {
   const authHeader = req.headers.authorization;
   if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    if (token) {
+    if (token && token !== 'undefined' && token !== 'null') {
       return token;
     }
   }
@@ -74,7 +74,7 @@ export async function requireAuth(
       );
     }
 
-    if (user.tokenVersion !== payload.tokenVersion) {
+    if ((user.tokenVersion ?? 0) !== (payload.tokenVersion ?? 0)) {
       throw new AppError(
         401,
         'TOKEN_REVOKED',

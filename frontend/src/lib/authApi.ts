@@ -66,6 +66,7 @@ export class ApiRequestError extends Error {
     super(message);
     this.statusCode = statusCode;
     this.code = code;
+    Object.setPrototypeOf(this, ApiRequestError.prototype);
   }
 }
 
@@ -90,12 +91,21 @@ async function parseJsonOrThrow<T>(response: Response): Promise<T> {
   return payload as T;
 }
 
-function buildAuthHeaders(accessToken: string | null): HeadersInit {
+function buildAuthHeaders(
+  accessToken: string | null,
+  hasJsonBody = false
+): HeadersInit {
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
     Accept: 'application/json',
   };
-  if (accessToken) {
+  if (hasJsonBody) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (
+    accessToken &&
+    accessToken !== 'undefined' &&
+    accessToken !== 'null'
+  ) {
     headers.Authorization = `Bearer ${accessToken}`;
   }
   return headers;
@@ -106,7 +116,7 @@ export async function registerCustomerApi(
 ): Promise<AuthSuccessPayload> {
   const response = await fetch(buildApiUrl('/auth/customer/register'), {
     method: 'POST',
-    headers: buildAuthHeaders(null),
+    headers: buildAuthHeaders(null, true),
     credentials: 'include',
     body: JSON.stringify(input),
   });
@@ -119,7 +129,7 @@ export async function loginCustomerApi(
 ): Promise<AuthSuccessPayload> {
   const response = await fetch(buildApiUrl('/auth/customer/login'), {
     method: 'POST',
-    headers: buildAuthHeaders(null),
+    headers: buildAuthHeaders(null, true),
     credentials: 'include',
     body: JSON.stringify(input),
   });
@@ -132,7 +142,7 @@ export async function logoutCustomerApi(
 ): Promise<void> {
   const response = await fetch(buildApiUrl('/auth/logout'), {
     method: 'POST',
-    headers: buildAuthHeaders(accessToken),
+    headers: buildAuthHeaders(accessToken, false),
     credentials: 'include',
   });
 
@@ -144,7 +154,7 @@ export async function fetchCustomerProfileApi(
 ): Promise<CustomerProfile> {
   const response = await fetch(buildApiUrl('/customer/profile'), {
     method: 'GET',
-    headers: buildAuthHeaders(accessToken),
+    headers: buildAuthHeaders(accessToken, false),
     credentials: 'include',
   });
 
@@ -162,7 +172,7 @@ export async function updateCustomerProfileApi(
 ): Promise<CustomerProfile> {
   const response = await fetch(buildApiUrl('/customer/profile'), {
     method: 'PATCH',
-    headers: buildAuthHeaders(accessToken),
+    headers: buildAuthHeaders(accessToken, true),
     credentials: 'include',
     body: JSON.stringify(input),
   });

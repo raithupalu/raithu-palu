@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import mongoose from 'mongoose';
 import {
   UserModel,
@@ -49,9 +51,86 @@ function mapDocToEntity(doc: IUserDocument): UserEntity {
   };
 }
 
+interface SerializedUserEntity extends Omit<
+  UserEntity,
+  'lastLoginAt' | 'lastLogoutAt' | 'createdAt' | 'updatedAt'
+> {
+  lastLoginAt: string | null;
+  lastLogoutAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 class InMemoryUserStore {
   private byId = new Map<string, UserEntity>();
   private byMobile = new Map<string, string>();
+  private readonly persistFilePath: string | null;
+
+  constructor() {
+    if (
+      env.NODE_ENV === 'development' &&
+      env.ALLOW_IN_MEMORY_AUTH_FALLBACK
+    ) {
+      const dataDir = path.resolve(process.cwd(), '.data');
+      this.persistFilePath = path.join(dataDir, 'dev-users.json');
+      this.loadFromDisk();
+    } else {
+      this.persistFilePath = null;
+    }
+  }
+
+  private loadFromDisk(): void {
+    if (!this.persistFilePath || !fs.existsSync(this.persistFilePath)) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this.persistFilePath, 'utf8');
+      const items = JSON.parse(raw) as SerializedUserEntity[];
+      this.byId.clear();
+      this.byMobile.clear();
+      for (const item of items) {
+        const entity: UserEntity = {
+          ...item,
+          lastLoginAt: item.lastLoginAt ? new Date(item.lastLoginAt) : null,
+          lastLogoutAt: item.lastLogoutAt ? new Date(item.lastLogoutAt) : null,
+          createdAt: new Date(item.createdAt),
+          updatedAt: new Date(item.updatedAt),
+        };
+        this.byId.set(entity.id, entity);
+        this.byMobile.set(entity.mobileNumber, entity.id);
+      }
+    } catch {
+      // Ignore corrupt dev cache file
+    }
+  }
+
+  private saveToDisk(): void {
+    if (!this.persistFilePath) {
+      return;
+    }
+    try {
+      const dir = path.dirname(this.persistFilePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const serialized: SerializedUserEntity[] = Array.from(
+        this.byId.values()
+      ).map((u) => ({
+        ...u,
+        lastLoginAt: u.lastLoginAt ? u.lastLoginAt.toISOString() : null,
+        lastLogoutAt: u.lastLogoutAt ? u.lastLogoutAt.toISOString() : null,
+        createdAt: u.createdAt.toISOString(),
+        updatedAt: u.updatedAt.toISOString(),
+      }));
+      fs.writeFileSync(
+        this.persistFilePath,
+        JSON.stringify(serialized, null, 2),
+        'utf8'
+      );
+    } catch {
+      // Ignore disk write errors in restricted environments
+    }
+  }
 
   public findByMobile(mobileNumber: string): UserEntity | null {
     const id = this.byMobile.get(mobileNumber);
@@ -93,6 +172,7 @@ class InMemoryUserStore {
 
     this.byId.set(id, entity);
     this.byMobile.set(input.mobileNumber, id);
+    this.saveToDisk();
     return { ...entity };
   }
 
@@ -101,6 +181,7 @@ class InMemoryUserStore {
     if (!existing) return null;
     existing.lastLoginAt = new Date();
     existing.updatedAt = new Date();
+    this.saveToDisk();
     return { ...existing };
   }
 
@@ -110,6 +191,7 @@ class InMemoryUserStore {
     existing.lastLogoutAt = new Date();
     existing.tokenVersion += 1;
     existing.updatedAt = new Date();
+    this.saveToDisk();
     return { ...existing };
   }
 
@@ -129,6 +211,7 @@ class InMemoryUserStore {
       };
     }
     existing.updatedAt = new Date();
+    this.saveToDisk();
     return { ...existing };
   }
 
@@ -156,12 +239,14 @@ class InMemoryUserStore {
     };
     this.byId.set(id, entity);
     this.byMobile.set(params.mobileNumber, id);
+    this.saveToDisk();
     return { ...entity };
   }
 
   public clear(): void {
     this.byId.clear();
     this.byMobile.clear();
+    this.saveToDisk();
   }
 }
 

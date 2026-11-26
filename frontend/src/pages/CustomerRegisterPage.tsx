@@ -1,11 +1,11 @@
 import { useState, type FormEvent } from 'react';
-import { Link, Navigate, useNavigate } from 'react-router-dom';
+import { Link, Navigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { ErrorState } from '../components/ErrorState';
+import { LoadingState } from '../components/LoadingState';
 
 export function CustomerRegisterPage() {
-  const { isAuthenticated, register } = useAuth();
-  const navigate = useNavigate();
+  const { user, isAuthenticated, isInitializing, register } = useAuth();
 
   const [fullName, setFullName] = useState('');
   const [mobileNumber, setMobileNumber] = useState('');
@@ -17,7 +17,18 @@ export function CustomerRegisterPage() {
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  if (isAuthenticated) {
+  if (isInitializing) {
+    return (
+      <div className="py-12">
+        <LoadingState
+          title="Checking Existing Session..."
+          message="Please wait while we verify your authentication state."
+        />
+      </div>
+    );
+  }
+
+  if (isAuthenticated && user) {
     return <Navigate to="/customer/profile" replace />;
   }
 
@@ -71,8 +82,6 @@ export function CustomerRegisterPage() {
             }
           : undefined,
       });
-
-      navigate('/customer/profile', { replace: true });
     } catch (err) {
       setErrorMessage(
         err instanceof Error
@@ -102,10 +111,7 @@ export function CustomerRegisterPage() {
 
         {errorMessage && (
           <div className="mb-6">
-            <ErrorState
-              title="Registration Error"
-              message={errorMessage}
-            />
+            <ErrorState title="Registration Error" message={errorMessage} />
           </div>
         )}
 

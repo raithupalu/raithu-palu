@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from 'react';
-import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { Link, Navigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { ErrorState } from '../components/ErrorState';
+import { LoadingState } from '../components/LoadingState';
 
 interface LocationRedirectState {
   from?: {
@@ -10,8 +11,14 @@ interface LocationRedirectState {
 }
 
 export function CustomerLoginPage() {
-  const { isAuthenticated, login } = useAuth();
-  const navigate = useNavigate();
+  const {
+    user,
+    isAuthenticated,
+    isInitializing,
+    sessionError,
+    clearSessionError,
+    login,
+  } = useAuth();
   const location = useLocation();
 
   const [mobileNumber, setMobileNumber] = useState('');
@@ -22,13 +29,26 @@ export function CustomerLoginPage() {
   const redirectState = location.state as LocationRedirectState | null;
   const targetPath = redirectState?.from?.pathname || '/customer/profile';
 
-  if (isAuthenticated) {
+  if (isInitializing) {
+    return (
+      <div className="py-12">
+        <LoadingState
+          title="Checking Existing Session..."
+          message="Please wait while we verify your authentication state."
+        />
+      </div>
+    );
+  }
+
+  // Declarative navigation after user and isAuthenticated state are committed in AuthContext
+  if (isAuthenticated && user) {
     return <Navigate to={targetPath} replace />;
   }
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setErrorMessage(null);
+    clearSessionError();
 
     const cleanedMobile = mobileNumber.replace(/[\s\-()]/g, '');
     if (!/^[6-9]\d{9}$/.test(cleanedMobile)) {
@@ -49,7 +69,6 @@ export function CustomerLoginPage() {
         mobileNumber: cleanedMobile,
         password,
       });
-      navigate(targetPath, { replace: true });
     } catch (err) {
       setErrorMessage(
         err instanceof Error
@@ -60,6 +79,8 @@ export function CustomerLoginPage() {
       setSubmitting(false);
     }
   }
+
+  const displayedError = errorMessage ?? sessionError;
 
   return (
     <div className="mx-auto max-w-md py-6">
@@ -76,12 +97,9 @@ export function CustomerLoginPage() {
           </p>
         </div>
 
-        {errorMessage && (
+        {displayedError && (
           <div className="mb-6">
-            <ErrorState
-              title="Sign-In Failed"
-              message={errorMessage}
-            />
+            <ErrorState title="Sign-In Failed" message={displayedError} />
           </div>
         )}
 
