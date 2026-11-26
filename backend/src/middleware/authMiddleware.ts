@@ -13,6 +13,11 @@ import { userRepository } from '../repositories/userRepository';
 
 export const AUTH_COOKIE_NAME = 'rp_access_token';
 
+export type AuthTokenSource =
+  | 'authorization_bearer'
+  | 'cookie_rp_access_token'
+  | 'none';
+
 export type AuthFailureStage =
   | 'NONE'
   | 'TOKEN_EXTRACTION'
@@ -27,8 +32,14 @@ export interface AuthRequestDiagnostics {
   bearerTokenExtracted: boolean;
   cookieHeaderPresent: boolean;
   rpAccessTokenCookieExtracted: boolean;
+  tokenSource: AuthTokenSource;
   failureStage: AuthFailureStage;
   errorCode: string | null;
+}
+
+export interface TokenCandidateEntry {
+  token: string;
+  source: Exclude<AuthTokenSource, 'none'>;
 }
 
 declare global {
@@ -125,18 +136,16 @@ function extractCookieToken(req: Request): string | null {
 }
 
 export function extractRequestCandidates(req: Request): {
-  candidates: string[];
-  diagnostics: Omit<AuthRequestDiagnostics, 'failureStage' | 'errorCode'>;
+  candidates: TokenCandidateEntry[];
+  diagnostics: Omit<
+    AuthRequestDiagnostics,
+    'tokenSource' | 'failureStage' | 'errorCode'
+  >;
 } {
   const authHeader = req.headers.authorization;
   const authorizationHeaderPresent =
     typeof authHeader === 'string' && authHeader.trim().length > 0;
   const bearerToken = extractBearerFromAuthorizationHeader(authHeader);
-
-  const xAuthHeader = req.headers['x-auth-token'];
-  const xAuthToken = sanitizeCandidateToken(
-    Array.isArray(xAuthHeader) ? xAuthHeader[0] : xAuthHeader
-  );
 
   const rawCookieHeader = req.headers.cookie;
   const parsedCookies = (req as Request & { cookies?: Record<string, unknown> })
@@ -147,11 +156,18 @@ export function extractRequestCandidates(req: Request): {
     Boolean(parsedCookies && Object.keys(parsedCookies).length > 0);
   const cookieToken = extractCookieToken(req);
 
-  const candidates: string[] = [];
-  for (const token of [bearerToken, xAuthToken, cookieToken]) {
-    if (token && !candidates.includes(token)) {
-      candidates.push(token);
-    }
+  const candidates: TokenCandidateEntry[] = [];
+  if (bearerToken) {
+    candidates.push({
+      token: bearerToken,
+      source: 'authorization_bearer',
+    });
+  }
+  if (cookieToken && cookieToken !== bearerToken) {
+    candidates.push({
+      token: cookieToken,
+      source: 'cookie_rp_access_token',
+    });
   }
 
   return {
@@ -167,7 +183,7 @@ export function extractRequestCandidates(req: Request): {
 
 export function extractRequestToken(req: Request): string | null {
   const { candidates } = extractRequestCandidates(req);
-  return candidates[0] ?? null;
+  return candidates[0]?.token ?? null;
 }
 
 function logAuthDiagnostics(
@@ -175,7 +191,7 @@ function logAuthDiagnostics(
   diagnostics: AuthRequestDiagnostics
 ): void {
   req.authDiagnostics = diagnostics;
-  // Safe diagnostic logging: logs ONLY boolean flags, failure stage, and error code; NEVER secrets/tokens/cookies
+  // Safe diagnostic logging: logs ONLY boolean flags, token source, failure stage, and error code; NEVER secrets/tokens/cookies
   if (diagnostics.failureStage !== 'NONE') {
     console.warn(
       '[AuthDiagnostics]',
@@ -187,6 +203,7 @@ function logAuthDiagnostics(
         cookieHeaderPresent: diagnostics.cookieHeaderPresent,
         rp_access_tokenCookieExtracted:
           diagnostics.rpAccessTokenCookieExtracted,
+        tokenSource: diagnostics.tokenSource,
         failureStage: diagnostics.failureStage,
         errorCode: diagnostics.errorCode,
       })
@@ -200,6 +217,7 @@ export async function requireAuth(
   next: NextFunction
 ): Promise<void> {
   const { candidates, diagnostics } = extractRequestCandidates(req);
+  const primarySource: AuthTokenSource = candidates[0]?.source ?? 'none';
 
   try {
     if (candidates.length === 0) {
@@ -210,6 +228,7 @@ export async function requireAuth(
       );
       logAuthDiagnostics(req, {
         ...diagnostics,
+        tokenSource: 'none',
         failureStage: 'TOKEN_EXTRACTION',
         errorCode: err.code,
       });
@@ -217,11 +236,13 @@ export async function requireAuth(
     }
 
     let verifiedPayload: JwtAccessPayload | null = null;
+    let verifiedSource: AuthTokenSource = primarySource;
     let lastVerificationError: unknown = null;
 
     for (const candidate of candidates) {
       try {
-        verifiedPayload = verifyAccessToken(candidate);
+        verifiedPayload = verifyAccessToken(candidate.token);
+        verifiedSource = candidate.source;
         break;
       } catch (verifyErr) {
         lastVerificationError = verifyErr;
@@ -239,6 +260,7 @@ export async function requireAuth(
             );
       logAuthDiagnostics(req, {
         ...diagnostics,
+        tokenSource: primarySource,
         failureStage: 'JWT_VERIFICATION',
         errorCode: appErr.code,
       });
@@ -254,6 +276,7 @@ export async function requireAuth(
       );
       logAuthDiagnostics(req, {
         ...diagnostics,
+        tokenSource: verifiedSource,
         failureStage: 'USER_LOOKUP',
         errorCode: err.code,
       });
@@ -268,6 +291,7 @@ export async function requireAuth(
       );
       logAuthDiagnostics(req, {
         ...diagnostics,
+        tokenSource: verifiedSource,
         failureStage: 'ACCOUNT_STATUS',
         errorCode: err.code,
       });
@@ -282,6 +306,7 @@ export async function requireAuth(
       );
       logAuthDiagnostics(req, {
         ...diagnostics,
+        tokenSource: verifiedSource,
         failureStage: 'TOKEN_VERSION',
         errorCode: err.code,
       });
@@ -292,6 +317,7 @@ export async function requireAuth(
     req.authTokenPayload = verifiedPayload;
     logAuthDiagnostics(req, {
       ...diagnostics,
+      tokenSource: verifiedSource,
       failureStage: 'NONE',
       errorCode: null,
     });

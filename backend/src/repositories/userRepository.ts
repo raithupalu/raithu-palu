@@ -64,23 +64,27 @@ interface SerializedUserEntity extends Omit<
 class InMemoryUserStore {
   private byId = new Map<string, UserEntity>();
   private byMobile = new Map<string, string>();
-  private readonly persistFilePath: string | null;
+  private readonly persistFilePath: string;
 
   constructor() {
-    if (
+    const dataDir = path.resolve(process.cwd(), '.data');
+    this.persistFilePath = path.join(dataDir, 'dev-users.json');
+    this.loadFromDisk();
+  }
+
+  private isDiskPersistenceEnabled(): boolean {
+    return (
+      process.env.NODE_ENV !== 'test' &&
       env.NODE_ENV === 'development' &&
       env.ALLOW_IN_MEMORY_AUTH_FALLBACK
-    ) {
-      const dataDir = path.resolve(process.cwd(), '.data');
-      this.persistFilePath = path.join(dataDir, 'dev-users.json');
-      this.loadFromDisk();
-    } else {
-      this.persistFilePath = null;
-    }
+    );
   }
 
   private loadFromDisk(): void {
-    if (!this.persistFilePath || !fs.existsSync(this.persistFilePath)) {
+    if (!this.isDiskPersistenceEnabled()) {
+      return;
+    }
+    if (!fs.existsSync(this.persistFilePath)) {
       return;
     }
     try {
@@ -105,7 +109,7 @@ class InMemoryUserStore {
   }
 
   private saveToDisk(): void {
-    if (!this.persistFilePath) {
+    if (!this.isDiskPersistenceEnabled()) {
       return;
     }
     try {
@@ -133,6 +137,7 @@ class InMemoryUserStore {
   }
 
   public findByMobile(mobileNumber: string): UserEntity | null {
+    this.loadFromDisk();
     const id = this.byMobile.get(mobileNumber);
     if (!id) return null;
     const entity = this.byId.get(id);
@@ -140,11 +145,13 @@ class InMemoryUserStore {
   }
 
   public findById(id: string): UserEntity | null {
+    this.loadFromDisk();
     const entity = this.byId.get(id);
     return entity ? { ...entity } : null;
   }
 
   public createCustomer(input: CreateCustomerInput): UserEntity {
+    this.loadFromDisk();
     if (this.byMobile.has(input.mobileNumber)) {
       throw new AppError(
         409,
@@ -177,6 +184,7 @@ class InMemoryUserStore {
   }
 
   public recordLogin(id: string): UserEntity | null {
+    this.loadFromDisk();
     const existing = this.byId.get(id);
     if (!existing) return null;
     existing.lastLoginAt = new Date();
@@ -186,6 +194,7 @@ class InMemoryUserStore {
   }
 
   public recordLogout(id: string): UserEntity | null {
+    this.loadFromDisk();
     const existing = this.byId.get(id);
     if (!existing) return null;
     existing.lastLogoutAt = new Date();
@@ -199,6 +208,7 @@ class InMemoryUserStore {
     id: string,
     updates: UpdateCustomerProfileInput
   ): UserEntity | null {
+    this.loadFromDisk();
     const existing = this.byId.get(id);
     if (!existing) return null;
     if (updates.fullName !== undefined) {

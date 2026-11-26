@@ -41,13 +41,7 @@ function buildCorsOptions(): CorsOptions {
       );
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-Auth-Token',
-      'Idempotency-Key',
-    ],
-    exposedHeaders: ['X-Auth-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
     credentials: true,
   };
 }

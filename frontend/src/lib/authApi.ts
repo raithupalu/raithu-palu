@@ -108,7 +108,7 @@ async function parseJsonOrThrow<T>(response: Response): Promise<T> {
   return payload as T;
 }
 
-function buildAuthHeaders(
+export function buildAuthHeaders(
   accessToken: string | null,
   hasJsonBody = false
 ): HeadersInit {
@@ -121,23 +121,19 @@ function buildAuthHeaders(
   if (isPlausibleJwt(accessToken)) {
     const cleanToken = accessToken.trim().replace(/^["']+|["']+$/g, '').trim();
     headers.Authorization = `Bearer ${cleanToken}`;
-    headers['X-Auth-Token'] = cleanToken;
   }
   return headers;
 }
 
 function normalizeAuthSuccessPayload(
-  raw: Record<string, unknown>,
-  response: Response
+  raw: Record<string, unknown>
 ): AuthSuccessPayload {
   const nestedData =
     raw.data && typeof raw.data === 'object'
       ? (raw.data as Record<string, unknown>)
       : {};
 
-  const headerToken = response.headers.get('X-Auth-Token');
-  const candidateToken =
-    nestedData.accessToken ?? raw.accessToken ?? headerToken;
+  const candidateToken = nestedData.accessToken ?? raw.accessToken;
   const candidateUser = (nestedData.user ?? raw.user) as
     | CustomerProfile
     | undefined;
@@ -178,7 +174,7 @@ export async function registerCustomerApi(
   });
 
   const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
-  return normalizeAuthSuccessPayload(raw, response);
+  return normalizeAuthSuccessPayload(raw);
 }
 
 export async function loginCustomerApi(
@@ -192,7 +188,7 @@ export async function loginCustomerApi(
   });
 
   const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
-  return normalizeAuthSuccessPayload(raw, response);
+  return normalizeAuthSuccessPayload(raw);
 }
 
 export async function logoutCustomerApi(

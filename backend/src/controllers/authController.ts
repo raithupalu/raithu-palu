@@ -35,7 +35,6 @@ function buildCookieOptions(req: Request): CookieOptions {
 
 function setAuthCookie(req: Request, res: Response, token: string): void {
   res.cookie(AUTH_COOKIE_NAME, token, buildCookieOptions(req));
-  res.setHeader('X-Auth-Token', token);
 }
 
 function clearAuthCookie(req: Request, res: Response): void {

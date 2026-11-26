@@ -18,6 +18,7 @@ export function CustomerProfilePage() {
   );
 
   const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -79,6 +80,24 @@ export function CustomerProfilePage() {
     }
   }
 
+  async function handleRefreshProfile() {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setRefreshing(true);
+    try {
+      await refreshProfile();
+      setSuccessMessage('Customer profile synchronized with server.');
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Failed to refresh customer profile.'
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
   async function handleLogout() {
     setLoggingOut(true);
     try {
@@ -117,10 +136,11 @@ export function CustomerProfilePage() {
         <div className="flex items-center gap-3">
           <button
             type="button"
-            onClick={() => void refreshProfile()}
-            className="rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
+            disabled={refreshing}
+            onClick={() => void handleRefreshProfile()}
+            className="rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
           >
-            Refresh Profile
+            {refreshing ? 'Refreshing...' : 'Refresh Profile'}
           </button>
           <button
             type="button"

@@ -23,44 +23,67 @@ import {
 
 const TOKEN_STORAGE_KEY = 'rp_customer_access_token';
 
+// Synchronous in-memory fallback so token is never lost if browser blocks third-party storage in iframes
+let inMemoryToken: string | null = null;
+
 export function readStoredToken(): string | null {
+  if (isPlausibleJwt(inMemoryToken)) {
+    return inMemoryToken;
+  }
+
   try {
     const localToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
     if (isPlausibleJwt(localToken)) {
-      return localToken.trim();
+      const clean = localToken.trim();
+      inMemoryToken = clean;
+      return clean;
     }
     if (localToken !== null) {
       window.localStorage.removeItem(TOKEN_STORAGE_KEY);
     }
+  } catch {
+    // localStorage may be blocked in cross-origin preview iframes
+  }
 
+  try {
     const sessionToken = window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
     if (isPlausibleJwt(sessionToken)) {
       const clean = sessionToken.trim();
-      window.localStorage.setItem(TOKEN_STORAGE_KEY, clean);
+      inMemoryToken = clean;
       return clean;
     }
     if (sessionToken !== null) {
       window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
     }
-
-    return null;
   } catch {
-    return null;
+    // sessionStorage may be blocked in restricted browsers
   }
+
+  return null;
 }
 
 export function writeStoredToken(token: string | null): void {
+  const validToken = isPlausibleJwt(token) ? token.trim() : null;
+  inMemoryToken = validToken;
+
   try {
-    if (isPlausibleJwt(token)) {
-      const clean = token.trim();
-      window.localStorage.setItem(TOKEN_STORAGE_KEY, clean);
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, clean);
+    if (validToken) {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, validToken);
     } else {
       window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore localStorage access errors in restricted browsers
+  }
+
+  try {
+    if (validToken) {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, validToken);
+    } else {
       window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
     }
   } catch {
-    // Ignore storage access errors in restricted browsers
+    // Ignore sessionStorage access errors in restricted browsers
   }
 }
 
@@ -96,12 +119,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [sessionError, setSessionError] = useState<string | null>(null);
-  const hasRestoredOnMount = useRef<boolean>(false);
+
+  const tokenRef = useRef<string | null>(accessToken);
+  const sessionEpochRef = useRef<number>(0);
 
   const persistToken = useCallback((token: string | null) => {
     const validToken = isPlausibleJwt(token) ? token.trim() : null;
-    setAccessToken(validToken);
+    tokenRef.current = validToken;
     writeStoredToken(validToken);
+    setAccessToken(validToken);
   }, []);
 
   const clearSessionError = useCallback(() => {
@@ -109,45 +135,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    if (hasRestoredOnMount.current) {
-      return;
-    }
-    hasRestoredOnMount.current = true;
-
     let active = true;
+    const effectEpoch = sessionEpochRef.current;
+
     async function restoreInitialSession() {
-      const initialToken = readStoredToken();
+      const initialToken = tokenRef.current ?? readStoredToken();
+
+      // Fresh application load without a stored token: do not fire an unauthenticated /api/customer/profile request
+      if (!initialToken) {
+        if (active && sessionEpochRef.current === effectEpoch) {
+          setUser(null);
+          setIsInitializing(false);
+          setIsLoading(false);
+        }
+        return;
+      }
+
       setIsInitializing(true);
       setIsLoading(true);
 
       try {
-        // Attempt profile fetch using stored Bearer token and/or httpOnly cookie
         const profile = await fetchCustomerProfileApi(initialToken);
-        if (active) {
+        if (active && sessionEpochRef.current === effectEpoch) {
           setUser(profile);
           setSessionError(null);
         }
       } catch (err) {
-        if (!active) return;
+        if (!active || sessionEpochRef.current !== effectEpoch) {
+          return;
+        }
 
         if (isDefinitiveAuthRejection(err)) {
           setUser(null);
-          if (initialToken) {
-            persistToken(null);
-          }
+          persistToken(null);
           setSessionError(null);
         } else {
-          // Do not treat transient network/server errors as a logout when a token exists
-          if (initialToken) {
-            setSessionError(
-              err instanceof Error
-                ? err.message
-                : 'Unable to verify customer session at this moment.'
-            );
-          }
+          setSessionError(
+            err instanceof Error
+              ? err.message
+              : 'Unable to verify customer session at this moment.'
+          );
         }
       } finally {
-        if (active) {
+        if (active && sessionEpochRef.current === effectEpoch) {
           setIsInitializing(false);
           setIsLoading(false);
         }
@@ -162,6 +192,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = useCallback(
     async (payload: RegisterCustomerPayload): Promise<CustomerProfile> => {
+      sessionEpochRef.current += 1;
       setIsLoading(true);
       setSessionError(null);
       try {
@@ -179,6 +210,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (payload: LoginCustomerPayload): Promise<CustomerProfile> => {
+      sessionEpochRef.current += 1;
       setIsLoading(true);
       setSessionError(null);
       try {
@@ -195,9 +227,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async (): Promise<void> => {
+    sessionEpochRef.current += 1;
     setIsLoading(true);
+    const currentToken = tokenRef.current ?? accessToken ?? readStoredToken();
     try {
-      const currentToken = accessToken ?? readStoredToken();
       await logoutCustomerApi(currentToken);
     } catch {
       // Even if server token already expired, complete local cleanup
@@ -210,7 +243,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [accessToken, persistToken]);
 
   const refreshProfile = useCallback(async (): Promise<CustomerProfile> => {
-    const currentToken = accessToken ?? readStoredToken();
+    const currentToken = tokenRef.current ?? accessToken ?? readStoredToken();
     setIsLoading(true);
     setSessionError(null);
     try {
@@ -241,7 +274,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const updateProfile = useCallback(
     async (payload: UpdateProfilePayload): Promise<CustomerProfile> => {
-      const currentToken = accessToken ?? readStoredToken();
+      const currentToken = tokenRef.current ?? accessToken ?? readStoredToken();
       const updated = await updateCustomerProfileApi(currentToken, payload);
       setUser(updated);
       setSessionError(null);
