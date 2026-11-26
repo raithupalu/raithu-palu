@@ -10,13 +10,14 @@ process.env.MONGODB_URI = 'mongodb://127.0.0.1:27017/raithu_palu_test';
 process.env.CORS_ORIGIN = '*';
 process.env.JWT_SECRET = 'test-only-raithu-palu-jwt-secret-key-minimum-32-chars';
 process.env.JWT_EXPIRES_IN = '1h';
-process.env.BCRYPT_SALT_ROUNDS = '10';
+process.env.BCRYPT_SALT_ROUNDS = '12';
 process.env.ALLOW_IN_MEMORY_AUTH_FALLBACK = 'true';
 
 import { app } from '../app';
 import { inMemoryUserStore } from '../repositories/userRepository';
 import { hashPassword, signAccessToken } from '../services/authService';
 import { extractRequestCandidates } from '../middleware/authMiddleware';
+import { env } from '../config/env';
 
 interface JsonResponse {
   status: number;
@@ -122,7 +123,10 @@ describe('Phase 1 Step 1: Customer Authentication Foundation & Regression Suite'
     const stored = inMemoryUserStore.findByMobile('9876543210');
     assert.ok(stored);
     assert.notEqual(stored.passwordHash, 'DairyPassword123');
-    assert.match(stored.passwordHash, /^\$2[ab]\$10\$/);
+    assert.match(
+      stored.passwordHash,
+      new RegExp(`^\\$2[ab]\\$${String(env.BCRYPT_SALT_ROUNDS).padStart(2, '0')}\\$`)
+    );
   });
 
   it('rejects duplicate mobile number registration with 409 MOBILE_ALREADY_REGISTERED', async () => {
