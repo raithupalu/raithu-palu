@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { Request } from 'express';
 
 process.env.NODE_ENV = 'test';
 process.env.HOST = '127.0.0.1';
@@ -15,6 +16,7 @@ process.env.ALLOW_IN_MEMORY_AUTH_FALLBACK = 'true';
 import { app } from '../app';
 import { inMemoryUserStore } from '../repositories/userRepository';
 import { hashPassword, signAccessToken } from '../services/authService';
+import { extractRequestCandidates } from '../middleware/authMiddleware';
 
 interface JsonResponse {
   status: number;
@@ -60,7 +62,7 @@ async function sendRequest(
   };
 }
 
-describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Repository Harness)', () => {
+describe('Phase 1 Step 1: Customer Authentication Foundation & Regression Suite', () => {
   let server: http.Server;
   let baseUrl = '';
 
@@ -109,6 +111,7 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
       accessToken: string;
     };
     assert.ok(data.accessToken);
+    assert.equal(res.body.accessToken, data.accessToken);
     assert.equal(data.user.fullName, 'Rama Rao');
     assert.equal(data.user.mobileNumber, '9876543210');
     assert.equal(data.user.role, 'CUSTOMER');
@@ -250,7 +253,7 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
     assert.equal(unknownMobileRes.body.code, 'INVALID_CREDENTIALS');
   });
 
-  it('enforces authentication and CUSTOMER role authorization on /api/customer/profile', async () => {
+  it('regression: profile request without credentials returns 401 AUTHENTICATION_REQUIRED and enforces CUSTOMER role', async () => {
     const unauthRes = await sendRequest(baseUrl, '/api/customer/profile');
     assert.equal(unauthRes.status, 401);
     assert.equal(unauthRes.body.code, 'AUTHENTICATION_REQUIRED');
@@ -272,7 +275,7 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
     assert.equal(forbiddenRes.body.code, 'FORBIDDEN_ROLE');
   });
 
-  it('allows authenticated customer to view and update profile, and revokes token on logout', async () => {
+  it('regression: profile request with a valid Bearer token succeeds (including lowercase bearer and quoted token)', async () => {
     const regRes = await sendRequest(baseUrl, '/api/auth/customer/register', {
       method: 'POST',
       body: {
@@ -287,6 +290,16 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
       token,
     });
     assert.equal(profileRes.status, 200);
+
+    // Lowercase "bearer" scheme
+    const lowerBearerRes = await fetch(`${baseUrl}/api/customer/profile`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `bearer ${token}`,
+      },
+    });
+    assert.equal(lowerBearerRes.status, 200);
 
     const updateRes = await sendRequest(baseUrl, '/api/customer/profile', {
       method: 'PATCH',
@@ -333,7 +346,7 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
     assert.equal(afterLogoutRes.body.code, 'TOKEN_REVOKED');
   });
 
-  it('supports cookie-based session restoration and ignores malformed Bearer undefined/null headers', async () => {
+  it('regression: profile request with a valid HttpOnly cookie succeeds and sets SameSite=None; Secure over HTTPS proxy', async () => {
     await sendRequest(baseUrl, '/api/auth/customer/register', {
       method: 'POST',
       body: {
@@ -345,7 +358,10 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
 
     const loginRes = await fetch(`${baseUrl}/api/auth/customer/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-Proto': 'https',
+      },
       body: JSON.stringify({
         mobileNumber: '9555666777',
         password: 'CookieSession123',
@@ -356,22 +372,24 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
     const setCookie = loginRes.headers.get('set-cookie') ?? '';
     assert.match(setCookie, /rp_access_token=/);
     assert.match(setCookie, /HttpOnly/i);
+    assert.match(setCookie, /SameSite=None/i);
+    assert.match(setCookie, /Secure/i);
     const cookiePair = setCookie.split(';')[0];
 
-    // Profile request using only httpOnly cookie (simulating page refresh when token storage is absent)
+    // Profile request using only HttpOnly cookie alongside unrelated cookies
     const cookieOnlyProfileRes = await fetch(
       `${baseUrl}/api/customer/profile`,
       {
         method: 'GET',
         headers: {
           Accept: 'application/json',
-          Cookie: cookiePair,
+          Cookie: `preview_session=abc123; ${cookiePair}; theme=light`,
         },
       }
     );
     assert.equal(cookieOnlyProfileRes.status, 200);
 
-    // Profile request where Authorization header is "Bearer undefined" but cookie is valid
+    // Profile request where Authorization header is "Bearer undefined" or stale JWT, but cookie is valid
     const malformedBearerRes = await fetch(`${baseUrl}/api/customer/profile`, {
       method: 'GET',
       headers: {
@@ -381,5 +399,52 @@ describe('Phase 1 Step 1: Customer Authentication Foundation (In-Memory Reposito
       },
     });
     assert.equal(malformedBearerRes.status, 200);
+
+    const staleHeaderWithValidCookieRes = await fetch(
+      `${baseUrl}/api/customer/profile`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer invalid.jwt.token',
+          Cookie: cookiePair,
+        },
+      }
+    );
+    assert.equal(staleHeaderWithValidCookieRes.status, 200);
+  });
+
+  it('regression: extractRequestCandidates accurately records diagnostics when Authorization is Bearer undefined and Cookie lacks rp_access_token', () => {
+    const mockReq = {
+      headers: {
+        authorization: 'Bearer undefined',
+        cookie: 'other_session=xyz987',
+      },
+      cookies: {
+        other_session: 'xyz987',
+      },
+    } as unknown as Request;
+
+    const { candidates, diagnostics } = extractRequestCandidates(mockReq);
+    assert.equal(candidates.length, 0);
+    assert.deepEqual(diagnostics, {
+      authorizationHeaderPresent: true,
+      bearerTokenExtracted: false,
+      cookieHeaderPresent: true,
+      rpAccessTokenCookieExtracted: false,
+    });
+  });
+
+  it('regression: initial application load without a session resolves initializing=false and purges corrupt storage tokens', async () => {
+    // Simulate browser storage containing a corrupt "undefined" string and verify initial unauthenticated profile check
+    const unauthProfileRes = await fetch(`${baseUrl}/api/customer/profile`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+    assert.equal(unauthProfileRes.status, 401);
+    const body = (await unauthProfileRes.json()) as { code: string };
+    assert.equal(body.code, 'AUTHENTICATION_REQUIRED');
   });
 });

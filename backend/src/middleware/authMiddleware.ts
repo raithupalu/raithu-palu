@@ -13,31 +13,185 @@ import { userRepository } from '../repositories/userRepository';
 
 export const AUTH_COOKIE_NAME = 'rp_access_token';
 
+export type AuthFailureStage =
+  | 'NONE'
+  | 'TOKEN_EXTRACTION'
+  | 'JWT_VERIFICATION'
+  | 'USER_LOOKUP'
+  | 'ACCOUNT_STATUS'
+  | 'TOKEN_VERSION'
+  | 'ROLE_AUTHORIZATION';
+
+export interface AuthRequestDiagnostics {
+  authorizationHeaderPresent: boolean;
+  bearerTokenExtracted: boolean;
+  cookieHeaderPresent: boolean;
+  rpAccessTokenCookieExtracted: boolean;
+  failureStage: AuthFailureStage;
+  errorCode: string | null;
+}
+
 declare global {
   namespace Express {
     interface Request {
       authUser?: PublicUserProfile;
       authTokenPayload?: JwtAccessPayload;
+      authDiagnostics?: AuthRequestDiagnostics;
     }
   }
 }
 
-export function extractRequestToken(req: Request): string | null {
-  const authHeader = req.headers.authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token && token !== 'undefined' && token !== 'null') {
-      return token;
-    }
+function sanitizeCandidateToken(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const unquoted = raw.trim().replace(/^["']+|["']+$/g, '').trim();
+  if (
+    !unquoted ||
+    unquoted === 'undefined' ||
+    unquoted === 'null' ||
+    unquoted === '[object Object]'
+  ) {
+    return null;
+  }
+  return unquoted;
+}
+
+function extractBearerFromAuthorizationHeader(
+  authHeader: unknown
+): string | null {
+  if (typeof authHeader !== 'string') {
+    return null;
+  }
+  const trimmed = authHeader.trim();
+  if (!trimmed) {
+    return null;
   }
 
-  const cookieToken = (req as Request & { cookies?: Record<string, unknown> })
-    .cookies?.[AUTH_COOKIE_NAME];
-  if (typeof cookieToken === 'string' && cookieToken.trim()) {
-    return cookieToken.trim();
+  // Match case-insensitive "Bearer <token>" with any whitespace
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
+  if (bearerMatch && bearerMatch[1]) {
+    return sanitizeCandidateToken(bearerMatch[1]);
+  }
+
+  // Fallback: if header contains a raw 3-part JWT without "Bearer" prefix
+  const directCandidate = sanitizeCandidateToken(trimmed);
+  if (
+    directCandidate &&
+    /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(directCandidate)
+  ) {
+    return directCandidate;
   }
 
   return null;
+}
+
+function extractCookieToken(req: Request): string | null {
+  const parsedCookies = (req as Request & { cookies?: Record<string, unknown> })
+    .cookies;
+  const fromCookieParser = sanitizeCandidateToken(
+    parsedCookies?.[AUTH_COOKIE_NAME]
+  );
+  if (fromCookieParser) {
+    return fromCookieParser;
+  }
+
+  // Fallback: parse raw Cookie header directly if cookie-parser did not populate req.cookies
+  const rawCookieHeader = req.headers.cookie;
+  if (typeof rawCookieHeader === 'string' && rawCookieHeader.length > 0) {
+    const segments = rawCookieHeader.split(';');
+    for (const segment of segments) {
+      const eqIndex = segment.indexOf('=');
+      if (eqIndex === -1) continue;
+      const name = segment.slice(0, eqIndex).trim();
+      if (name !== AUTH_COOKIE_NAME) continue;
+      const rawValue = segment.slice(eqIndex + 1).trim();
+      try {
+        const decoded = decodeURIComponent(rawValue);
+        const sanitized = sanitizeCandidateToken(decoded);
+        if (sanitized) {
+          return sanitized;
+        }
+      } catch {
+        const sanitized = sanitizeCandidateToken(rawValue);
+        if (sanitized) {
+          return sanitized;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+export function extractRequestCandidates(req: Request): {
+  candidates: string[];
+  diagnostics: Omit<AuthRequestDiagnostics, 'failureStage' | 'errorCode'>;
+} {
+  const authHeader = req.headers.authorization;
+  const authorizationHeaderPresent =
+    typeof authHeader === 'string' && authHeader.trim().length > 0;
+  const bearerToken = extractBearerFromAuthorizationHeader(authHeader);
+
+  const xAuthHeader = req.headers['x-auth-token'];
+  const xAuthToken = sanitizeCandidateToken(
+    Array.isArray(xAuthHeader) ? xAuthHeader[0] : xAuthHeader
+  );
+
+  const rawCookieHeader = req.headers.cookie;
+  const parsedCookies = (req as Request & { cookies?: Record<string, unknown> })
+    .cookies;
+  const cookieHeaderPresent =
+    (typeof rawCookieHeader === 'string' &&
+      rawCookieHeader.trim().length > 0) ||
+    Boolean(parsedCookies && Object.keys(parsedCookies).length > 0);
+  const cookieToken = extractCookieToken(req);
+
+  const candidates: string[] = [];
+  for (const token of [bearerToken, xAuthToken, cookieToken]) {
+    if (token && !candidates.includes(token)) {
+      candidates.push(token);
+    }
+  }
+
+  return {
+    candidates,
+    diagnostics: {
+      authorizationHeaderPresent,
+      bearerTokenExtracted: Boolean(bearerToken),
+      cookieHeaderPresent,
+      rpAccessTokenCookieExtracted: Boolean(cookieToken),
+    },
+  };
+}
+
+export function extractRequestToken(req: Request): string | null {
+  const { candidates } = extractRequestCandidates(req);
+  return candidates[0] ?? null;
+}
+
+function logAuthDiagnostics(
+  req: Request,
+  diagnostics: AuthRequestDiagnostics
+): void {
+  req.authDiagnostics = diagnostics;
+  // Safe diagnostic logging: logs ONLY boolean flags, failure stage, and error code; NEVER secrets/tokens/cookies
+  if (diagnostics.failureStage !== 'NONE') {
+    console.warn(
+      '[AuthDiagnostics]',
+      JSON.stringify({
+        method: req.method,
+        path: req.originalUrl,
+        authorizationHeaderPresent: diagnostics.authorizationHeaderPresent,
+        bearerTokenExtracted: diagnostics.bearerTokenExtracted,
+        cookieHeaderPresent: diagnostics.cookieHeaderPresent,
+        rp_access_tokenCookieExtracted:
+          diagnostics.rpAccessTokenCookieExtracted,
+        failureStage: diagnostics.failureStage,
+        errorCode: diagnostics.errorCode,
+      })
+    );
+  }
 }
 
 export async function requireAuth(
@@ -45,45 +199,102 @@ export async function requireAuth(
   _res: Response,
   next: NextFunction
 ): Promise<void> {
+  const { candidates, diagnostics } = extractRequestCandidates(req);
+
   try {
-    const token = extractRequestToken(req);
-    if (!token) {
-      throw new AppError(
+    if (candidates.length === 0) {
+      const err = new AppError(
         401,
         'AUTHENTICATION_REQUIRED',
         'Authentication is required to access this resource.'
       );
+      logAuthDiagnostics(req, {
+        ...diagnostics,
+        failureStage: 'TOKEN_EXTRACTION',
+        errorCode: err.code,
+      });
+      throw err;
     }
 
-    const payload = verifyAccessToken(token);
-    const user = await userRepository.findById(payload.sub);
+    let verifiedPayload: JwtAccessPayload | null = null;
+    let lastVerificationError: unknown = null;
 
+    for (const candidate of candidates) {
+      try {
+        verifiedPayload = verifyAccessToken(candidate);
+        break;
+      } catch (verifyErr) {
+        lastVerificationError = verifyErr;
+      }
+    }
+
+    if (!verifiedPayload) {
+      const appErr =
+        lastVerificationError instanceof AppError
+          ? lastVerificationError
+          : new AppError(
+              401,
+              'INVALID_OR_EXPIRED_TOKEN',
+              'Authentication token is invalid or has expired.'
+            );
+      logAuthDiagnostics(req, {
+        ...diagnostics,
+        failureStage: 'JWT_VERIFICATION',
+        errorCode: appErr.code,
+      });
+      throw appErr;
+    }
+
+    const user = await userRepository.findById(verifiedPayload.sub);
     if (!user) {
-      throw new AppError(
+      const err = new AppError(
         401,
         'INVALID_TOKEN_USER',
         'Authenticated account no longer exists.'
       );
+      logAuthDiagnostics(req, {
+        ...diagnostics,
+        failureStage: 'USER_LOOKUP',
+        errorCode: err.code,
+      });
+      throw err;
     }
 
     if (user.status !== 'ACTIVE') {
-      throw new AppError(
+      const err = new AppError(
         403,
         'ACCOUNT_INACTIVE',
         `Your account status is ${user.status}. Access denied.`
       );
+      logAuthDiagnostics(req, {
+        ...diagnostics,
+        failureStage: 'ACCOUNT_STATUS',
+        errorCode: err.code,
+      });
+      throw err;
     }
 
-    if ((user.tokenVersion ?? 0) !== (payload.tokenVersion ?? 0)) {
-      throw new AppError(
+    if ((user.tokenVersion ?? 0) !== (verifiedPayload.tokenVersion ?? 0)) {
+      const err = new AppError(
         401,
         'TOKEN_REVOKED',
         'Authentication session has been invalidated. Please log in again.'
       );
+      logAuthDiagnostics(req, {
+        ...diagnostics,
+        failureStage: 'TOKEN_VERSION',
+        errorCode: err.code,
+      });
+      throw err;
     }
 
     req.authUser = toPublicUserProfile(user);
-    req.authTokenPayload = payload;
+    req.authTokenPayload = verifiedPayload;
+    logAuthDiagnostics(req, {
+      ...diagnostics,
+      failureStage: 'NONE',
+      errorCode: null,
+    });
     next();
   } catch (err) {
     next(err);
@@ -93,24 +304,36 @@ export async function requireAuth(
 export function requireRole(...allowedRoles: UserRole[]) {
   return (req: Request, _res: Response, next: NextFunction): void => {
     if (!req.authUser) {
-      next(
-        new AppError(
-          401,
-          'AUTHENTICATION_REQUIRED',
-          'Authentication is required to access this resource.'
-        )
+      const err = new AppError(
+        401,
+        'AUTHENTICATION_REQUIRED',
+        'Authentication is required to access this resource.'
       );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'ROLE_AUTHORIZATION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
       return;
     }
 
     if (!allowedRoles.includes(req.authUser.role)) {
-      next(
-        new AppError(
-          403,
-          'FORBIDDEN_ROLE',
-          `Access denied. Required role: ${allowedRoles.join(' or ')}.`
-        )
+      const err = new AppError(
+        403,
+        'FORBIDDEN_ROLE',
+        `Access denied. Required role: ${allowedRoles.join(' or ')}.`
       );
+      if (req.authDiagnostics) {
+        logAuthDiagnostics(req, {
+          ...req.authDiagnostics,
+          failureStage: 'ROLE_AUTHORIZATION',
+          errorCode: err.code,
+        });
+      }
+      next(err);
       return;
     }
 

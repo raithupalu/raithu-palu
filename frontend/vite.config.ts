@@ -16,6 +16,7 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: backendProxyTarget,
           changeOrigin: true,
+          xfwd: true,
         },
       },
     },

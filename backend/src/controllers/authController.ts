@@ -1,24 +1,49 @@
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, CookieOptions } from 'express';
 import { env } from '../config/env';
 import { AUTH_COOKIE_NAME } from '../middleware/authMiddleware';
 import { AppError } from '../middleware/notFound';
 import { authService } from '../services/authService';
 
-function setAuthCookie(res: Response, token: string): void {
-  res.cookie(AUTH_COOKIE_NAME, token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: env.NODE_ENV === 'production',
-    path: '/',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+function isHttpsRequest(req: Request): boolean {
+  if (req.secure || env.NODE_ENV === 'production') {
+    return true;
+  }
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  if (typeof forwardedProto === 'string') {
+    return forwardedProto
+      .split(',')
+      .map((p) => p.trim().toLowerCase())
+      .includes('https');
+  }
+  if (Array.isArray(forwardedProto)) {
+    return forwardedProto.some((p) => p.toLowerCase().includes('https'));
+  }
+  return false;
 }
 
-function clearAuthCookie(res: Response): void {
+function buildCookieOptions(req: Request): CookieOptions {
+  const https = isHttpsRequest(req);
+  return {
+    httpOnly: true,
+    sameSite: https ? 'none' : 'lax',
+    secure: https,
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    ...(https ? ({ partitioned: true } as Partial<CookieOptions>) : {}),
+  };
+}
+
+function setAuthCookie(req: Request, res: Response, token: string): void {
+  res.cookie(AUTH_COOKIE_NAME, token, buildCookieOptions(req));
+  res.setHeader('X-Auth-Token', token);
+}
+
+function clearAuthCookie(req: Request, res: Response): void {
+  const https = isHttpsRequest(req);
   res.clearCookie(AUTH_COOKIE_NAME, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: env.NODE_ENV === 'production',
+    sameSite: https ? 'none' : 'lax',
+    secure: https,
     path: '/',
   });
 }
@@ -36,11 +61,14 @@ export const authController = {
           : {};
 
       const session = await authService.registerCustomer(body);
-      setAuthCookie(res, session.accessToken);
+      setAuthCookie(req, res, session.accessToken);
 
       res.status(201).json({
         status: 'ok',
         message: 'Customer account registered successfully.',
+        user: session.user,
+        accessToken: session.accessToken,
+        expiresIn: session.expiresIn,
         data: {
           user: session.user,
           accessToken: session.accessToken,
@@ -64,11 +92,14 @@ export const authController = {
           : {};
 
       const session = await authService.loginCustomer(body);
-      setAuthCookie(res, session.accessToken);
+      setAuthCookie(req, res, session.accessToken);
 
       res.status(200).json({
         status: 'ok',
         message: 'Customer logged in successfully.',
+        user: session.user,
+        accessToken: session.accessToken,
+        expiresIn: session.expiresIn,
         data: {
           user: session.user,
           accessToken: session.accessToken,
@@ -95,7 +126,7 @@ export const authController = {
       }
 
       await authService.logoutSession(req.authTokenPayload);
-      clearAuthCookie(res);
+      clearAuthCookie(req, res);
 
       res.status(200).json({
         status: 'ok',
@@ -126,8 +157,10 @@ export const authController = {
 
       res.status(200).json({
         status: 'ok',
+        user: profile,
         data: {
           user: profile,
+          profile,
         },
       });
     } catch (err) {

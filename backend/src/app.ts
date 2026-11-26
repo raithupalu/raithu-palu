@@ -41,7 +41,13 @@ function buildCorsOptions(): CorsOptions {
       );
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Auth-Token',
+      'Idempotency-Key',
+    ],
+    exposedHeaders: ['X-Auth-Token'],
     credentials: true,
   };
 }
@@ -50,6 +56,7 @@ export function createApp(): Application {
   const app = express();
 
   app.disable('x-powered-by');
+  app.set('trust proxy', 1);
 
   // Security headers via Helmet (frameguard disabled for live preview compatibility)
   app.use(
@@ -62,7 +69,7 @@ export function createApp(): Application {
   // Environment-driven CORS configuration
   app.use(cors(buildCorsOptions()));
 
-  // Cookie parser for httpOnly authentication cookies
+  // Cookie parser registered before all route and authentication middleware
   app.use(cookieParser());
 
   // Reasonable request-size limits

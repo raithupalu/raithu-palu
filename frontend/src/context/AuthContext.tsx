@@ -13,6 +13,7 @@ import {
   type LoginCustomerPayload,
   type UpdateProfilePayload,
   ApiRequestError,
+  isPlausibleJwt,
   registerCustomerApi,
   loginCustomerApi,
   logoutCustomerApi,
@@ -22,31 +23,38 @@ import {
 
 const TOKEN_STORAGE_KEY = 'rp_customer_access_token';
 
-function readStoredToken(): string | null {
+export function readStoredToken(): string | null {
   try {
     const localToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
-    if (localToken && localToken !== 'undefined' && localToken !== 'null') {
-      return localToken;
+    if (isPlausibleJwt(localToken)) {
+      return localToken.trim();
     }
+    if (localToken !== null) {
+      window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+
     const sessionToken = window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    if (
-      sessionToken &&
-      sessionToken !== 'undefined' &&
-      sessionToken !== 'null'
-    ) {
-      return sessionToken;
+    if (isPlausibleJwt(sessionToken)) {
+      const clean = sessionToken.trim();
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, clean);
+      return clean;
     }
+    if (sessionToken !== null) {
+      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+
     return null;
   } catch {
     return null;
   }
 }
 
-function writeStoredToken(token: string | null): void {
+export function writeStoredToken(token: string | null): void {
   try {
-    if (token && token !== 'undefined' && token !== 'null') {
-      window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+    if (isPlausibleJwt(token)) {
+      const clean = token.trim();
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, clean);
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, clean);
     } else {
       window.localStorage.removeItem(TOKEN_STORAGE_KEY);
       window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -91,8 +99,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const hasRestoredOnMount = useRef<boolean>(false);
 
   const persistToken = useCallback((token: string | null) => {
-    setAccessToken(token);
-    writeStoredToken(token);
+    const validToken = isPlausibleJwt(token) ? token.trim() : null;
+    setAccessToken(validToken);
+    writeStoredToken(validToken);
   }, []);
 
   const clearSessionError = useCallback(() => {

@@ -70,6 +70,23 @@ export class ApiRequestError extends Error {
   }
 }
 
+export function isPlausibleJwt(value: unknown): value is string {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const trimmed = value.trim().replace(/^["']+|["']+$/g, '').trim();
+  if (
+    !trimmed ||
+    trimmed === 'undefined' ||
+    trimmed === 'null' ||
+    trimmed === '[object Object]'
+  ) {
+    return false;
+  }
+  const parts = trimmed.split('.');
+  return parts.length === 3 && parts.every((segment) => segment.length > 0);
+}
+
 async function parseJsonOrThrow<T>(response: Response): Promise<T> {
   let payload: Record<string, unknown> = {};
   try {
@@ -101,14 +118,53 @@ function buildAuthHeaders(
   if (hasJsonBody) {
     headers['Content-Type'] = 'application/json';
   }
-  if (
-    accessToken &&
-    accessToken !== 'undefined' &&
-    accessToken !== 'null'
-  ) {
-    headers.Authorization = `Bearer ${accessToken}`;
+  if (isPlausibleJwt(accessToken)) {
+    const cleanToken = accessToken.trim().replace(/^["']+|["']+$/g, '').trim();
+    headers.Authorization = `Bearer ${cleanToken}`;
+    headers['X-Auth-Token'] = cleanToken;
   }
   return headers;
+}
+
+function normalizeAuthSuccessPayload(
+  raw: Record<string, unknown>,
+  response: Response
+): AuthSuccessPayload {
+  const nestedData =
+    raw.data && typeof raw.data === 'object'
+      ? (raw.data as Record<string, unknown>)
+      : {};
+
+  const headerToken = response.headers.get('X-Auth-Token');
+  const candidateToken =
+    nestedData.accessToken ?? raw.accessToken ?? headerToken;
+  const candidateUser = (nestedData.user ?? raw.user) as
+    | CustomerProfile
+    | undefined;
+  const expiresIn =
+    typeof nestedData.expiresIn === 'string'
+      ? nestedData.expiresIn
+      : typeof raw.expiresIn === 'string'
+        ? raw.expiresIn
+        : '7d';
+
+  if (!isPlausibleJwt(candidateToken) || !candidateUser) {
+    throw new ApiRequestError(
+      500,
+      'INVALID_AUTH_RESPONSE',
+      'Authentication server did not return a valid session token.'
+    );
+  }
+
+  return {
+    status: typeof raw.status === 'string' ? raw.status : 'ok',
+    message: typeof raw.message === 'string' ? raw.message : 'Authenticated',
+    data: {
+      user: candidateUser,
+      accessToken: candidateToken.trim(),
+      expiresIn,
+    },
+  };
 }
 
 export async function registerCustomerApi(
@@ -121,7 +177,8 @@ export async function registerCustomerApi(
     body: JSON.stringify(input),
   });
 
-  return parseJsonOrThrow<AuthSuccessPayload>(response);
+  const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
+  return normalizeAuthSuccessPayload(raw, response);
 }
 
 export async function loginCustomerApi(
@@ -134,7 +191,8 @@ export async function loginCustomerApi(
     body: JSON.stringify(input),
   });
 
-  return parseJsonOrThrow<AuthSuccessPayload>(response);
+  const raw = await parseJsonOrThrow<Record<string, unknown>>(response);
+  return normalizeAuthSuccessPayload(raw, response);
 }
 
 export async function logoutCustomerApi(
@@ -160,10 +218,21 @@ export async function fetchCustomerProfileApi(
 
   const result = await parseJsonOrThrow<{
     status: string;
-    data: { profile: CustomerProfile };
+    profile?: CustomerProfile;
+    data?: { profile?: CustomerProfile; user?: CustomerProfile };
   }>(response);
 
-  return result.data.profile;
+  const profile =
+    result.data?.profile ?? result.data?.user ?? result.profile;
+  if (!profile) {
+    throw new ApiRequestError(
+      500,
+      'INVALID_PROFILE_RESPONSE',
+      'Profile payload missing from server response.'
+    );
+  }
+
+  return profile;
 }
 
 export async function updateCustomerProfileApi(
@@ -179,8 +248,18 @@ export async function updateCustomerProfileApi(
 
   const result = await parseJsonOrThrow<{
     status: string;
-    data: { profile: CustomerProfile };
+    profile?: CustomerProfile;
+    data?: { profile?: CustomerProfile };
   }>(response);
 
-  return result.data.profile;
+  const profile = result.data?.profile ?? result.profile;
+  if (!profile) {
+    throw new ApiRequestError(
+      500,
+      'INVALID_PROFILE_RESPONSE',
+      'Updated profile payload missing from server response.'
+    );
+  }
+
+  return profile;
 }
